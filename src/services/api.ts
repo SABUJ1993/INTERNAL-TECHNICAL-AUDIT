@@ -833,23 +833,46 @@ export function mergeDraftPreservingPhotos(
   return { factoryInfo: mergedFactory, sections: mergedSections };
 }
 
-export function saveActiveDraftImmediate(draft: any): void {
+export async function saveActiveDraftImmediate(
+  draft: any
+): Promise<{ ok: boolean; updatedAt?: string; error?: string }> {
   const currentEmail = getCurrentUser()?.email?.trim().toLowerCase() || '';
+  const updatedAt = new Date().toISOString();
   const stampedDraft = draft
     ? {
         ...draft,
         ownerEmail: currentEmail || draft.ownerEmail || '',
-        updatedAt: new Date().toISOString(),
+        updatedAt,
       }
     : null;
+
+  if (cloudSyncTimer) {
+    clearTimeout(cloudSyncTimer);
+    cloudSyncTimer = null;
+  }
 
   writeLightLocalDraft(stampedDraft);
   if (stampedDraft) {
     saveDraftToIndexedDB(stampedDraft).catch(() => {});
     const clientId = getClientDeviceId();
-    syncDraftToFirestore(stampedDraft, clientId, currentEmail).catch(() => {});
+
+    if (await isBackendServerAvailable()) {
+      fetch('/api/active-draft', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          ...stampedDraft,
+          clientId,
+          ownerEmail: currentEmail || stampedDraft.ownerEmail || '',
+          lastUpdatedBy: stampedDraft?.factoryInfo?.auditorName || 'Auditor',
+        }),
+      }).catch(() => {});
+    }
+
+    return await syncDraftToFirestore(stampedDraft, clientId, currentEmail);
   } else {
     clearDraftFromIndexedDB().catch(() => {});
+    return { ok: true, updatedAt };
   }
 }
 
@@ -873,12 +896,12 @@ export function saveActiveDraft(draft: any, isExplicitDelete = false): void {
   // 2. Ultra-light LocalStorage backup (metadata only, <10KB, never blocks UI thread)
   writeLightLocalDraft(stampedDraft);
 
-  // 3. Debounced Cloud Network Sync (Firestore + Server SSE) - avoids freezing UI during rapid inputs
+  // 3. Debounced Cloud Network Sync (Firestore + Server SSE) - fast 250ms sync across Mobile & PC
   if (cloudSyncTimer) clearTimeout(cloudSyncTimer);
 
-  const delay = isExplicitDelete ? 50 : 800;
+  const delay = isExplicitDelete ? 50 : 250;
   cloudSyncTimer = setTimeout(async () => {
-    // A. Direct Firestore Real-Time Sync across Mobile APK & Browser
+    // A. Direct Firestore Real-Time Sync across Mobile & PC Browser
     try {
       const clientId = getClientDeviceId();
       syncDraftToFirestore(stampedDraft, clientId, currentEmail).catch(() => {});
@@ -893,6 +916,7 @@ export function saveActiveDraft(draft: any, isExplicitDelete = false): void {
         const payload = {
           ...stampedDraft,
           clientId,
+          ownerEmail: currentEmail || stampedDraft?.ownerEmail || '',
           isExplicitDelete,
           lastUpdatedBy: stampedDraft?.factoryInfo?.auditorName || 'Auditor',
         };

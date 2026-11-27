@@ -177,6 +177,7 @@ export default function App() {
   const [isSaved, setIsSaved] = useState(true);
   const [isLiveConnected, setIsLiveConnected] = useState(true);
   const [syncMessage, setSyncMessage] = useState<string>('Live Synced');
+  const [syncingCheckpointId, setSyncingCheckpointId] = useState<string | null>(null);
   const [activeSectionId, setActiveSectionId] = useState<string>(() => {
     const draft = loadActiveDraft();
     return draft?.activeSectionId || sections[0]?.id || 'warehouse';
@@ -211,6 +212,8 @@ export default function App() {
   const syncTimeoutRef = useRef<any>(null);
   const editingReportIdRef = useRef<string | null>(null);
   editingReportIdRef.current = editingReportId;
+  const lastLocalEditTsRef = useRef<number>(0);
+  const lastWakeFetchTsRef = useRef<number>(0);
 
   // Refs holding latest state so mobile minimize / visibilitychange flush always saves fresh data & photos
   const latestDraftRef = useRef({
@@ -278,6 +281,10 @@ export default function App() {
     };
     const nextSections = normalizeAuditSections(merged.sections);
     isRemoteUpdateRef.current = true;
+    const remoteTs = new Date(draftPayload.updatedAt || Date.now()).getTime();
+    if (remoteTs > lastLocalEditTsRef.current) {
+      lastLocalEditTsRef.current = remoteTs;
+    }
     setFactoryInfo(nextFactory);
     setSections(nextSections);
     if (draftPayload.activeSectionId) {
@@ -455,6 +462,7 @@ export default function App() {
       return;
     }
 
+    lastLocalEditTsRef.current = Date.now();
     setIsSaved(false);
     const timer = setTimeout(() => {
       saveActiveDraft({
@@ -464,34 +472,116 @@ export default function App() {
         activeSectionId,
       });
       setIsSaved(true);
-    }, 600);
+    }, 300);
     return () => clearTimeout(timer);
   }, [factoryInfo, sections, currentTab, activeSectionId, currentUser, editingReportId]);
 
-  // Instant flush on mobile minimize / tab switch / pagehide so ZERO data or photos are ever lost
+  // Instant flush on mobile minimize + foreground wake-up cloud re-sync on visibility/focus/online
   useEffect(() => {
     if (!currentUser) return;
     const flushNow = () => {
       if (!isInitializedRef.current || editingReportIdRef.current) return;
-      saveActiveDraftImmediate(latestDraftRef.current);
+      saveActiveDraftImmediate(latestDraftRef.current).catch(() => {});
+    };
+
+    const pullLatestOnWake = async () => {
+      if (!isInitializedRef.current || editingReportIdRef.current || !currentUser?.email) return;
+      const now = Date.now();
+      if (now - lastWakeFetchTsRef.current < 1500) return;
+      lastWakeFetchTsRef.current = now;
+      try {
+        const [firestoreDraft, serverDraft] = await Promise.all([
+          fetchDraftFromFirestore(currentUser.email).catch(() => null),
+          fetchServerActiveDraft().catch(() => null),
+        ]);
+        const remoteDraft =
+          firestoreDraft && serverDraft
+            ? new Date(firestoreDraft.updatedAt || 0).getTime() >= new Date(serverDraft.updatedAt || 0).getTime()
+              ? firestoreDraft
+              : serverDraft
+            : firestoreDraft || serverDraft;
+
+        if (remoteDraft && !editingReportIdRef.current) {
+          const remoteTs = new Date(remoteDraft.updatedAt || 0).getTime();
+          if (remoteTs > lastLocalEditTsRef.current) {
+            applyAuthoritativeDraft(remoteDraft, { isAuthoritative: true, persistToIdb: true });
+            setSyncMessage('Live Mobile/PC Synced');
+            if (syncTimeoutRef.current) clearTimeout(syncTimeoutRef.current);
+            syncTimeoutRef.current = setTimeout(() => {
+              setSyncMessage('Live Synced');
+            }, 2500);
+          }
+        }
+      } catch {
+        // ignore transient network errors on wake
+      }
     };
 
     const handleVisibility = () => {
       if (document.visibilityState === 'hidden') {
         flushNow();
+      } else if (document.visibilityState === 'visible') {
+        pullLatestOnWake();
       }
     };
 
     document.addEventListener('visibilitychange', handleVisibility);
+    window.addEventListener('focus', pullLatestOnWake);
+    window.addEventListener('online', pullLatestOnWake);
     window.addEventListener('pagehide', flushNow);
     window.addEventListener('beforeunload', flushNow);
 
     return () => {
       document.removeEventListener('visibilitychange', handleVisibility);
+      window.removeEventListener('focus', pullLatestOnWake);
+      window.removeEventListener('online', pullLatestOnWake);
       window.removeEventListener('pagehide', flushNow);
       window.removeEventListener('beforeunload', flushNow);
     };
   }, [currentUser]);
+
+  const handleSyncCheckpoint = async (checkpointId: string, updatedSections: AuditSection[]) => {
+    setSyncingCheckpointId(checkpointId);
+    lastLocalEditTsRef.current = Date.now();
+    setSyncMessage('Saving Draft & Syncing Live...');
+    if (syncTimeoutRef.current) clearTimeout(syncTimeoutRef.current);
+
+    try {
+      if (!editingReportIdRef.current) {
+        const res = await saveActiveDraftImmediate({
+          factoryInfo: latestDraftRef.current.factoryInfo,
+          sections: updatedSections,
+          currentTab: latestDraftRef.current.currentTab,
+          activeSectionId: latestDraftRef.current.activeSectionId,
+        });
+        setIsSaved(true);
+        setSyncMessage(res.ok ? 'Draft Saved & Live Synced' : 'Saved Locally (Retrying Cloud)');
+      } else if (!editingReportIdRef.current.startsWith('LIVE-')) {
+        const recalculated = calculateAuditReport(
+          latestDraftRef.current.factoryInfo,
+          updatedSections,
+          currentReport?.id,
+          currentReport?.createdAt
+        );
+        await handleSaveReportDirect({
+          ...recalculated,
+          executiveSummary: customExecutiveSummary ?? recalculated.executiveSummary,
+          auditorEmail: currentReport?.auditorEmail || currentUser?.email?.toLowerCase(),
+          submittedAt: currentReport?.submittedAt,
+          capItems: currentReport?.capItems,
+          capUpdatedAt: currentReport?.capUpdatedAt,
+          dismissedCapIds: currentReport?.dismissedCapIds,
+        });
+      }
+    } catch {
+      setSyncMessage('Saved Locally');
+    } finally {
+      setSyncingCheckpointId(null);
+      syncTimeoutRef.current = setTimeout(() => {
+        setSyncMessage('Live Synced');
+      }, 3000);
+    }
+  };
 
   const handleOpenPhotoAction = (
     evidence: CheckpointEvidence,
@@ -1267,6 +1357,8 @@ export default function App() {
             onSubmitAndGenerateReport={handleSubmitAndGenerateReport}
             onOpenPreviewImage={setActivePreviewImage}
             onOpenPhotoAction={handleOpenPhotoAction}
+            onSyncCheckpoint={handleSyncCheckpoint}
+            syncingCheckpointId={syncingCheckpointId}
             activeSectionId={activeSectionId}
             onSelectSection={setActiveSectionId}
           />

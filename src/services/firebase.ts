@@ -1,6 +1,7 @@
 import { initializeApp, getApps, getApp } from 'firebase/app';
 import {
   getFirestore,
+  initializeFirestore,
   doc,
   setDoc,
   getDoc,
@@ -16,13 +17,13 @@ import { AuditReportData, CheckpointEvidence } from '../types/audit';
 import appletConfig from '../../firebase-applet-config.json';
 
 export const firebaseConfig = {
-  apiKey: appletConfig.apiKey || "AIzaSyAzG0942tsO4UD-oJyZ2R-fS06TPSXNtFA",
-  authDomain: appletConfig.authDomain || "internal-technical-audit-3c4a2.firebaseapp.com",
-  projectId: appletConfig.projectId || "internal-technical-audit-3c4a2",
-  storageBucket: appletConfig.storageBucket || "internal-technical-audit-3c4a2.firebasestorage.app",
-  messagingSenderId: appletConfig.messagingSenderId || "855910717408",
-  appId: appletConfig.appId || "1:855910717408:web:a05acf320974968e93fd85",
-  firestoreDatabaseId: appletConfig.firestoreDatabaseId || "ai-studio-qualitechqmsfact-c1a5ae65-4f9c-4993-82e8-9aec32b878f3"
+  apiKey: appletConfig.apiKey,
+  authDomain: appletConfig.authDomain,
+  projectId: appletConfig.projectId,
+  storageBucket: appletConfig.storageBucket,
+  messagingSenderId: appletConfig.messagingSenderId,
+  appId: appletConfig.appId,
+  firestoreDatabaseId: appletConfig.firestoreDatabaseId,
 };
 
 export enum OperationType {
@@ -52,20 +53,45 @@ export function logFirestoreError(error: unknown, operationType: OperationType, 
 // Initialize Firebase App
 export const firebaseApp = getApps().length === 0 ? initializeApp(firebaseConfig) : getApp();
 
-// Initialize Firestore
+// Initialize Firestore with ignoreUndefinedProperties & auto-detect long polling (mobile/proxy friendly)
 let firestoreInstance: any = null;
 try {
+  const firestoreSettings = {
+    ignoreUndefinedProperties: true,
+    experimentalAutoDetectLongPolling: true,
+  };
   firestoreInstance = firebaseConfig.firestoreDatabaseId
-    ? getFirestore(firebaseApp, firebaseConfig.firestoreDatabaseId)
-    : getFirestore(firebaseApp);
+    ? initializeFirestore(firebaseApp, firestoreSettings, firebaseConfig.firestoreDatabaseId)
+    : initializeFirestore(firebaseApp, firestoreSettings);
 } catch (e) {
   try {
-    firestoreInstance = getFirestore(firebaseApp);
+    firestoreInstance = firebaseConfig.firestoreDatabaseId
+      ? getFirestore(firebaseApp, firebaseConfig.firestoreDatabaseId)
+      : getFirestore(firebaseApp);
   } catch (err) {
     console.warn('Firestore initialization fallback', err);
   }
 }
 export const db = firestoreInstance;
+
+/**
+ * Recursively strips `undefined` properties from objects before Firestore writes
+ * so Firestore `setDoc` never rejects documents with `invalid-argument`.
+ */
+export function sanitizeForFirestore<T>(value: T): T {
+  if (value === undefined) return null as unknown as T;
+  if (value === null || typeof value !== 'object') return value;
+  if (Array.isArray(value)) {
+    return value.map((item) => (item === undefined ? null : sanitizeForFirestore(item))) as unknown as T;
+  }
+  const cleanObj: Record<string, any> = {};
+  for (const [k, v] of Object.entries(value as Record<string, any>)) {
+    if (v !== undefined) {
+      cleanObj[k] = sanitizeForFirestore(v);
+    }
+  }
+  return cleanObj as T;
+}
 
 // Startup connection check
 async function testConnection() {
@@ -144,12 +170,15 @@ async function ensureCloudPhotoStored(
     // Guard single photo size under 900KB
     if (dataUrl.length < 900000) {
       const photoRef = doc(db, DRAFT_PHOTOS_COLLECTION, photoKey);
-      await setDoc(photoRef, {
-        photoId: photoKey,
-        ownerEmail: ownerEmail ? ownerEmail.trim().toLowerCase() : null,
-        dataUrl,
-        updatedAt: new Date().toISOString(),
-      });
+      await setDoc(
+        photoRef,
+        sanitizeForFirestore({
+          photoId: photoKey,
+          ownerEmail: ownerEmail ? ownerEmail.trim().toLowerCase() : null,
+          dataUrl,
+          updatedAt: new Date().toISOString(),
+        })
+      );
       syncedPhotoKeySet.add(photoKey);
       return `${CLOUD_PHOTO_PREFIX}${photoKey}`;
     }
@@ -427,41 +456,49 @@ export async function syncDraftToFirestore(
   draft: any,
   clientId?: string,
   userEmail?: string | null
-): Promise<void> {
-  if (!db) return;
+): Promise<{ ok: boolean; updatedAt?: string; error?: string }> {
+  if (!db) return { ok: false, error: 'Firestore not initialized' };
   const docId = getDraftDocId(userEmail);
   const path = `${DRAFT_COLLECTION}/${docId}`;
+  const updatedAt = new Date().toISOString();
   try {
     const docRef = doc(db, DRAFT_COLLECTION, docId);
     if (!draft) {
-      await setDoc(docRef, {
-        clearedAt: new Date().toISOString(),
-        ownerEmail: userEmail ? userEmail.trim().toLowerCase() : null,
-        senderClientId: clientId || null,
-        factoryInfo: null,
-        sections: null,
-        updatedAt: new Date().toISOString(),
-      });
-      return;
+      await setDoc(
+        docRef,
+        sanitizeForFirestore({
+          clearedAt: updatedAt,
+          ownerEmail: userEmail ? userEmail.trim().toLowerCase() : null,
+          senderClientId: clientId || null,
+          factoryInfo: null,
+          sections: null,
+          updatedAt,
+        })
+      );
+      return { ok: true, updatedAt };
     }
 
     const baseDraft = {
       ...draft,
       ownerEmail: userEmail ? userEmail.trim().toLowerCase() : draft.ownerEmail || null,
       senderClientId: clientId || null,
-      updatedAt: new Date().toISOString(),
+      updatedAt: draft.updatedAt || updatedAt,
       clearedAt: null,
     };
 
-    const cleanDraft = await offloadPayloadPhotos(docId, baseDraft, userEmail);
+    const offloadedDraft = await offloadPayloadPhotos(docId, baseDraft, userEmail);
+    const cleanDraft = sanitizeForFirestore(offloadedDraft);
     await setDoc(docRef, cleanDraft, { merge: false });
+    return { ok: true, updatedAt: cleanDraft.updatedAt || updatedAt };
   } catch (err) {
     logFirestoreError(err, OperationType.WRITE, path);
+    return { ok: false, error: err instanceof Error ? err.message : String(err) };
   }
 }
 
 /**
- * Fetches and hydrates the current user's active draft directly from Firestore (Mobile <-> PC startup & manual refresh)
+ * Fetches and hydrates the current user's active draft directly from Firestore server
+ * (falls back to cache if offline) so Mobile <-> PC wake-up & startup are always up to date.
  */
 export async function fetchDraftFromFirestore(userEmail?: string | null): Promise<any | null> {
   if (!db || !userEmail) return null;
@@ -469,7 +506,12 @@ export async function fetchDraftFromFirestore(userEmail?: string | null): Promis
   const path = `${DRAFT_COLLECTION}/${docId}`;
   try {
     const docRef = doc(db, DRAFT_COLLECTION, docId);
-    const snap = await getDoc(docRef);
+    let snap;
+    try {
+      snap = await getDocFromServer(docRef);
+    } catch {
+      snap = await getDoc(docRef);
+    }
     if (!snap.exists()) return null;
     const data = snap.data();
     if (!data || data.clearedAt) return null;
@@ -484,8 +526,8 @@ export async function fetchDraftFromFirestore(userEmail?: string | null): Promis
 }
 
 /**
- * Subscribes to real-time Firestore updates across Mobile APK and PC Browser for this auditor
- * and hydrates any synced cloud photos automatically.
+ * Subscribes to real-time Firestore updates across Mobile and PC Browser for this auditor
+ * and hydrates any synced cloud photos automatically with out-of-order guard.
  */
 export function subscribeToFirestoreDraft(
   onUpdate: (draft: any) => void,
@@ -495,6 +537,7 @@ export function subscribeToFirestoreDraft(
   if (!db) return () => {};
   const docId = getDraftDocId(userEmail);
   const path = `${DRAFT_COLLECTION}/${docId}`;
+  let latestSnapshotSeq = 0;
   try {
     const docRef = doc(db, DRAFT_COLLECTION, docId);
     return onSnapshot(
@@ -509,6 +552,8 @@ export function subscribeToFirestoreDraft(
           return;
         }
 
+        const seq = ++latestSnapshotSeq;
+
         if (data.clearedAt && !data.factoryInfo && !data.sections) {
           onUpdate({ clearedAt: data.clearedAt, updatedAt: data.updatedAt });
           return;
@@ -516,6 +561,7 @@ export function subscribeToFirestoreDraft(
 
         if (data.factoryInfo || data.sections) {
           const hydrated = await hydratePayloadPhotos(data);
+          if (seq !== latestSnapshotSeq) return;
           onUpdate(hydrated);
         }
       },
@@ -566,14 +612,17 @@ export async function clearFirestoreDraft(
   const path = `${DRAFT_COLLECTION}/${docId}`;
   try {
     const docRef = doc(db, DRAFT_COLLECTION, docId);
-    await setDoc(docRef, {
-      clearedAt: new Date().toISOString(),
-      ownerEmail: userEmail ? userEmail.trim().toLowerCase() : null,
-      senderClientId: clientId || null,
-      factoryInfo: null,
-      sections: null,
-      updatedAt: new Date().toISOString(),
-    });
+    await setDoc(
+      docRef,
+      sanitizeForFirestore({
+        clearedAt: new Date().toISOString(),
+        ownerEmail: userEmail ? userEmail.trim().toLowerCase() : null,
+        senderClientId: clientId || null,
+        factoryInfo: null,
+        sections: null,
+        updatedAt: new Date().toISOString(),
+      })
+    );
   } catch (err) {
     logFirestoreError(err, OperationType.WRITE, path);
   }
@@ -592,7 +641,7 @@ export async function saveAuditToFirestore(report: AuditReportData): Promise<voi
       approxSize > 700000
         ? await offloadPayloadPhotos(`rep_${report.id}`, report, report.auditorEmail)
         : report;
-    await setDoc(docRef, payloadToSave);
+    await setDoc(docRef, sanitizeForFirestore(payloadToSave));
   } catch (err) {
     logFirestoreError(err, OperationType.WRITE, path);
   }

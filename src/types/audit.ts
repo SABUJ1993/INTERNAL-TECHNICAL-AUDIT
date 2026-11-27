@@ -89,6 +89,8 @@ export interface CheckpointItem {
   notes: string;
   images: CheckpointEvidence[];
   isCustom?: boolean;
+  isUpdated?: boolean;
+  lastSyncedAt?: string;
 }
 
 export interface AuditSection {

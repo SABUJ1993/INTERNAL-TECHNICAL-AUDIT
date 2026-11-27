@@ -45,6 +45,8 @@ interface Props {
   onSubmitAndGenerateReport: () => void;
   onOpenPreviewImage: (evidence: CheckpointEvidence) => void;
   onOpenPhotoAction?: (evidence: CheckpointEvidence, sourceLocation: PhotoLocation) => void;
+  onSyncCheckpoint?: (checkpointId: string, updatedSections: AuditSection[]) => Promise<void> | void;
+  syncingCheckpointId?: string | null;
   activeSectionId?: string;
   onSelectSection?: (id: string) => void;
 }
@@ -117,6 +119,8 @@ export const AuditSectionView: React.FC<Props> = ({
   onSubmitAndGenerateReport,
   onOpenPreviewImage,
   onOpenPhotoAction,
+  onSyncCheckpoint,
+  syncingCheckpointId,
   activeSectionId: externalActiveSectionId,
   onSelectSection,
 }) => {
@@ -195,6 +199,7 @@ export const AuditSectionView: React.FC<Props> = ({
           return {
             ...cp,
             score: cp.score === score ? null : score,
+            isUpdated: false,
           };
         }),
       };
@@ -207,10 +212,32 @@ export const AuditSectionView: React.FC<Props> = ({
       if (sec.id !== currentSection.id) return sec;
       return {
         ...sec,
-        checkpoints: sec.checkpoints.map((cp) => (cp.id === checkpointId ? { ...cp, notes } : cp)),
+        checkpoints: sec.checkpoints.map((cp) =>
+          cp.id === checkpointId ? { ...cp, notes, isUpdated: false } : cp
+        ),
       };
     });
     onUpdateSections(updated);
+  };
+
+  const handleToggleCheckpointUpdate = (checkpointId: string) => {
+    const now = new Date().toISOString();
+    const updated = sections.map((sec) => {
+      if (sec.id !== currentSection.id) return sec;
+      return {
+        ...sec,
+        checkpoints: sec.checkpoints.map((cp) => {
+          if (cp.id !== checkpointId) return cp;
+          return {
+            ...cp,
+            isUpdated: !cp.isUpdated,
+            lastSyncedAt: now,
+          };
+        }),
+      };
+    });
+    onUpdateSections(updated);
+    onSyncCheckpoint?.(checkpointId, updated);
   };
 
   const handleAddRemarkChip = (checkpointId: string, chipText: string) => {
@@ -259,6 +286,7 @@ export const AuditSectionView: React.FC<Props> = ({
             return {
               ...cp,
               images: [...cp.images, ...newEvidences],
+              isUpdated: false,
             };
           }),
         };
@@ -297,6 +325,7 @@ export const AuditSectionView: React.FC<Props> = ({
           return {
             ...cp,
             images: cp.images.filter((img) => img.id !== imageId),
+            isUpdated: false,
           };
         }),
       };
@@ -474,8 +503,34 @@ export const AuditSectionView: React.FC<Props> = ({
                     <p className="text-xs text-slate-600 leading-relaxed font-normal">{cp.description}</p>
                   </div>
 
-                  {/* Actions: Help, Delete */}
-                  <div className="flex items-center gap-1 shrink-0 self-end sm:self-start">
+                  {/* Actions: Update & Live Sync Checkbox, Help, Edit, Delete */}
+                  <div className="flex items-center gap-1.5 shrink-0 self-end sm:self-start">
+                    <label
+                      onClick={(e) => e.stopPropagation()}
+                      className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg border text-[11px] font-bold transition-all cursor-pointer select-none ${
+                        syncingCheckpointId === cp.id
+                          ? 'bg-blue-50 text-blue-700 border-blue-300'
+                          : cp.isUpdated
+                          ? 'bg-emerald-50 text-emerald-700 border-emerald-300 shadow-2xs'
+                          : 'bg-slate-50 hover:bg-blue-50 text-slate-700 hover:text-blue-700 border-slate-300 hover:border-blue-300'
+                      }`}
+                      title="Save draft and sync this checkpoint live to all logged-in devices"
+                    >
+                      <input
+                        type="checkbox"
+                        checked={Boolean(cp.isUpdated)}
+                        onChange={() => handleToggleCheckpointUpdate(cp.id)}
+                        className="w-3.5 h-3.5 rounded accent-emerald-600 cursor-pointer"
+                      />
+                      <span>
+                        {syncingCheckpointId === cp.id
+                          ? 'Syncing...'
+                          : cp.isUpdated
+                          ? 'Updated'
+                          : 'Update'}
+                      </span>
+                    </label>
+
                     {cp.guidelines && (
                       <button
                         type="button"
