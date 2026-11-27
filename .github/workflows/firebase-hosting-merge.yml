@@ -23,12 +23,14 @@ jobs:
         run: npm install --no-audit --no-fund
 
       - name: Build production app
+        env:
+          VITE_BASE_PATH: /
         run: npm run build
 
       - name: Deploy to Firebase Hosting (web.app)
         uses: FirebaseExtended/action-hosting-deploy@v0
         with:
           repoToken: '${{ secrets.GITHUB_TOKEN }}'
-          firebaseServiceAccount: '${{ secrets.FIREBASE_SERVICE_ACCOUNT_INTERNAL_TECHNICAL_AUDIT_3C4A2 || secrets.FIREBASE_SERVICE_ACCOUNT }}'
+          firebaseServiceAccount: '${{ secrets.FIREBASE_SERVICE_ACCOUNT_GARMENTS_TECHNICAL_AUDIT || secrets.FIREBASE_SERVICE_ACCOUNT }}'
           channelId: live
-          projectId: internal-technical-audit-3c4a2
+          projectId: garments-technical-audit

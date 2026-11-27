@@ -83,7 +83,7 @@ export const Header: React.FC<Props> = ({
         {/* Brand: Internal Technical Audit with App Icon */}
         <div className="flex items-center gap-1.5 sm:gap-2 shrink min-w-0">
           <img
-            src="/app-icon.png"
+            src={`${import.meta.env.BASE_URL}app-icon.png`}
             alt="App Icon"
             className="w-7 h-7 sm:w-8 sm:h-8 rounded-lg object-cover shadow-xs border border-slate-200 shrink-0"
           />

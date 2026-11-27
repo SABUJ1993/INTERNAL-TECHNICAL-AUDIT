@@ -305,7 +305,7 @@ export const LoginScreen: React.FC<Props> = ({ onLoginSuccess }) => {
     <div
       className="min-h-screen w-full relative flex flex-col justify-between p-4 sm:p-8 lg:p-12 bg-slate-900 bg-cover bg-center bg-no-repeat overflow-x-hidden"
       style={{
-        backgroundImage: `linear-gradient(to right, rgba(15, 23, 42, 0.40) 0%, rgba(15, 23, 42, 0.22) 50%, rgba(15, 23, 42, 0.35) 100%), url('/assets/aistudio/image_9e8b2608.png')`,
+        backgroundImage: `linear-gradient(to right, rgba(15, 23, 42, 0.40) 0%, rgba(15, 23, 42, 0.22) 50%, rgba(15, 23, 42, 0.35) 100%), url('${import.meta.env.BASE_URL}assets/aistudio/image_9e8b2608.png')`,
       }}
     >
       {/* Light subtle backdrop overlay to ensure bright background and perfect text legibility */}
@@ -318,7 +318,7 @@ export const LoginScreen: React.FC<Props> = ({ onLoginSuccess }) => {
           {/* Logo & Tag Badge */}
           <div className="flex items-center gap-3">
             <img
-              src="/app-icon.png"
+              src={`${import.meta.env.BASE_URL}app-icon.png`}
               alt="Internal Technical Audit Logo"
               className="w-16 h-16 sm:w-20 sm:h-20 rounded-2xl shadow-xl border-2 border-white/80 ring-4 ring-blue-500/25 object-cover shrink-0"
             />

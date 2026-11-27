@@ -29,8 +29,8 @@ export function useAppUpdate() {
     checkInProgressRef.current = true;
 
     try {
-      // 1. Fetch /version.json with aggressive cache-busting
-      const res = await fetch(`/version.json?_t=${Date.now()}`, {
+      // 1. Fetch version.json with aggressive cache-busting (works on both root / and GitHub Pages subpath)
+      const res = await fetch(`${import.meta.env.BASE_URL}version.json?_t=${Date.now()}`, {
         cache: 'no-store',
         headers: {
           'Cache-Control': 'no-cache, no-store, must-revalidate',

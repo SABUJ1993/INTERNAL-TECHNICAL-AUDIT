@@ -31,12 +31,12 @@ export const ShareAppModal: React.FC<Props> = ({
 
   if (!isOpen) return null;
 
-  // Use the active runtime origin or canonical Firebase Hosting web.app URL
+  // Use the active runtime origin + base path or canonical Firebase Hosting web.app URL
   const shareUrl = typeof window !== 'undefined'
     ? (window.location.origin.includes('localhost')
-        ? 'https://internal-technical-audit-3c4a2.web.app'
-        : window.location.origin)
-    : 'https://internal-technical-audit-3c4a2.web.app';
+        ? 'https://garments-technical-audit.web.app'
+        : `${window.location.origin}${import.meta.env.BASE_URL === '/' ? '' : import.meta.env.BASE_URL}`)
+    : 'https://garments-technical-audit.web.app';
 
   const handleCopy = () => {
     navigator.clipboard.writeText(shareUrl);
@@ -90,7 +90,7 @@ export const ShareAppModal: React.FC<Props> = ({
         {/* App Icon & Identity Card */}
         <div className="px-6 py-3.5 flex items-center gap-3.5 bg-slate-50 border-b border-slate-200/80">
           <img
-            src="/app-icon.png"
+            src={`${import.meta.env.BASE_URL}app-icon.png`}
             alt="Internal Technical Audit Icon"
             className="w-14 h-14 rounded-2xl shadow-md border border-slate-200 object-cover shrink-0"
           />
@@ -224,7 +224,7 @@ export const ShareAppModal: React.FC<Props> = ({
 
             <div className="flex flex-col sm:flex-row gap-2">
               <a
-                href="/Internal_Technical_Audit_Production_Build.zip"
+                href={`${import.meta.env.BASE_URL}Internal_Technical_Audit_Production_Build.zip`}
                 download="Internal_Technical_Audit_Production_Build.zip"
                 className="flex-1 py-2.5 px-3 rounded-xl bg-amber-600 hover:bg-amber-700 text-white font-bold text-xs shadow-md shadow-amber-600/20 flex items-center justify-center gap-2 transition-all cursor-pointer text-center"
               >
