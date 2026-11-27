@@ -459,21 +459,44 @@ export async function loginAuditor(identifier: string, password: string): Promis
 
 export function getCurrentUser(): AuditorUser | null {
   try {
-    const raw =
-      localStorage.getItem(SESSION_PERSISTENCE_KEY) ||
-      sessionStorage.getItem(USER_KEY) ||
-      localStorage.getItem(USER_KEY);
-    return raw ? JSON.parse(raw) : null;
+    // Prefer tab-scoped sessionStorage first so opening Admin in Tab 1 & Auditor in Tab 2 never cross-contaminates!
+    const sessionRaw = sessionStorage.getItem(USER_KEY);
+    if (sessionRaw) {
+      return JSON.parse(sessionRaw);
+    }
+    const persistedRaw =
+      localStorage.getItem(SESSION_PERSISTENCE_KEY) || localStorage.getItem(USER_KEY);
+    if (persistedRaw) {
+      // Pin to this tab's sessionStorage so subsequent logins in other tabs don't hijack this tab
+      try {
+        sessionStorage.setItem(USER_KEY, persistedRaw);
+      } catch {}
+      return JSON.parse(persistedRaw);
+    }
+    return null;
   } catch {
     return null;
   }
 }
 
-export function logoutAuditor(): void {
+export function logoutAuditor(targetEmail?: string | null): void {
   try {
     sessionStorage.removeItem(USER_KEY);
-    localStorage.removeItem(USER_KEY);
-    localStorage.removeItem(SESSION_PERSISTENCE_KEY);
+    const normalizedTarget = targetEmail?.trim().toLowerCase();
+    if (!normalizedTarget) {
+      localStorage.removeItem(USER_KEY);
+      localStorage.removeItem(SESSION_PERSISTENCE_KEY);
+      return;
+    }
+    const persistedRaw =
+      localStorage.getItem(SESSION_PERSISTENCE_KEY) || localStorage.getItem(USER_KEY);
+    if (persistedRaw) {
+      const parsed = JSON.parse(persistedRaw);
+      if (!parsed?.email || parsed.email.trim().toLowerCase() === normalizedTarget) {
+        localStorage.removeItem(USER_KEY);
+        localStorage.removeItem(SESSION_PERSISTENCE_KEY);
+      }
+    }
   } catch {
     // ignore
   }
@@ -847,14 +870,20 @@ export function mergeDraftPreservingPhotos(
 }
 
 export async function saveActiveDraftImmediate(
-  draft: any
+  draft: any,
+  userEmail?: string | null
 ): Promise<{ ok: boolean; updatedAt?: string; error?: string }> {
-  const currentEmail = getCurrentUser()?.email?.trim().toLowerCase() || '';
+  const currentEmail = (userEmail || draft?.ownerEmail || getCurrentUser()?.email || '')
+    .trim()
+    .toLowerCase();
+  if (!currentEmail) {
+    return { ok: false, error: 'Missing auditor email' };
+  }
   const updatedAt = new Date().toISOString();
   const stampedDraft = draft
     ? {
         ...draft,
-        ownerEmail: currentEmail || draft.ownerEmail || '',
+        ownerEmail: currentEmail,
         updatedAt,
       }
     : null;
@@ -876,7 +905,7 @@ export async function saveActiveDraftImmediate(
         body: JSON.stringify({
           ...stampedDraft,
           clientId,
-          ownerEmail: currentEmail || stampedDraft.ownerEmail || '',
+          ownerEmail: currentEmail,
           lastUpdatedBy: stampedDraft?.factoryInfo?.auditorName || 'Auditor',
         }),
       }).catch(() => {});
@@ -889,13 +918,22 @@ export async function saveActiveDraftImmediate(
   }
 }
 
-export function saveActiveDraft(draft: any, isExplicitDelete = false): void {
-  const currentEmail = getCurrentUser()?.email?.trim().toLowerCase() || '';
+export function saveActiveDraft(
+  draft: any,
+  isExplicitDelete = false,
+  userEmail?: string | null
+): void {
+  const currentEmail = (userEmail || draft?.ownerEmail || getCurrentUser()?.email || '')
+    .trim()
+    .toLowerCase();
+  if (!currentEmail) return;
+
+  const updatedAt = new Date().toISOString();
   const stampedDraft = draft
     ? {
         ...draft,
-        ownerEmail: currentEmail || draft.ownerEmail || '',
-        updatedAt: new Date().toISOString(),
+        ownerEmail: currentEmail,
+        updatedAt,
       }
     : null;
 
@@ -923,13 +961,13 @@ export function saveActiveDraft(draft: any, isExplicitDelete = false): void {
     }
 
     // B. Background server sync (only when Express backend is running)
-    if (await isBackendServerAvailable()) {
+    if (await isBackendServerAvailable() && stampedDraft) {
       try {
         const clientId = getClientDeviceId();
         const payload = {
           ...stampedDraft,
           clientId,
-          ownerEmail: currentEmail || stampedDraft?.ownerEmail || '',
+          ownerEmail: currentEmail,
           isExplicitDelete,
           lastUpdatedBy: stampedDraft?.factoryInfo?.auditorName || 'Auditor',
         };
@@ -1062,7 +1100,11 @@ export function subscribeToLiveDraftStream(
         if (!e.data || e.data === 'null') return;
         try {
           const draft = JSON.parse(e.data);
-          if (draft?.ownerEmail && effectiveEmail && draft.ownerEmail.trim().toLowerCase() !== effectiveEmail) {
+          const currentDeviceId = getClientDeviceId();
+          if (draft?.senderClientId && draft.senderClientId === currentDeviceId) {
+            return;
+          }
+          if (!effectiveEmail || !draft?.ownerEmail || draft.ownerEmail.trim().toLowerCase() !== effectiveEmail) {
             return;
           }
           if (draft && (draft.factoryInfo || draft.sections)) {
@@ -1083,7 +1125,7 @@ export function subscribeToLiveDraftStream(
           if (draft.senderClientId && draft.senderClientId === currentDeviceId) {
             return;
           }
-          if (draft?.ownerEmail && effectiveEmail && draft.ownerEmail.trim().toLowerCase() !== effectiveEmail) {
+          if (!effectiveEmail || !draft?.ownerEmail || draft.ownerEmail.trim().toLowerCase() !== effectiveEmail) {
             return;
           }
 

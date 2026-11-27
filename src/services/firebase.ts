@@ -458,7 +458,9 @@ export async function syncDraftToFirestore(
   userEmail?: string | null
 ): Promise<{ ok: boolean; updatedAt?: string; error?: string }> {
   if (!db) return { ok: false, error: 'Firestore not initialized' };
-  const docId = getDraftDocId(userEmail);
+  const normalizedEmail = (userEmail || draft?.ownerEmail || '').trim().toLowerCase();
+  if (!normalizedEmail) return { ok: false, error: 'Missing auditor email for cloud sync' };
+  const docId = getDraftDocId(normalizedEmail);
   const path = `${DRAFT_COLLECTION}/${docId}`;
   const updatedAt = new Date().toISOString();
   try {
@@ -468,7 +470,7 @@ export async function syncDraftToFirestore(
         docRef,
         sanitizeForFirestore({
           clearedAt: updatedAt,
-          ownerEmail: userEmail ? userEmail.trim().toLowerCase() : null,
+          ownerEmail: normalizedEmail,
           senderClientId: clientId || null,
           factoryInfo: null,
           sections: null,
@@ -480,13 +482,13 @@ export async function syncDraftToFirestore(
 
     const baseDraft = {
       ...draft,
-      ownerEmail: userEmail ? userEmail.trim().toLowerCase() : draft.ownerEmail || null,
+      ownerEmail: normalizedEmail,
       senderClientId: clientId || null,
       updatedAt: draft.updatedAt || updatedAt,
       clearedAt: null,
     };
 
-    const offloadedDraft = await offloadPayloadPhotos(docId, baseDraft, userEmail);
+    const offloadedDraft = await offloadPayloadPhotos(docId, baseDraft, normalizedEmail);
     const cleanDraft = sanitizeForFirestore(offloadedDraft);
     await setDoc(docRef, cleanDraft, { merge: false });
     return { ok: true, updatedAt: cleanDraft.updatedAt || updatedAt };
@@ -534,8 +536,9 @@ export function subscribeToFirestoreDraft(
   currentClientId?: string,
   userEmail?: string | null
 ): Unsubscribe {
-  if (!db) return () => {};
-  const docId = getDraftDocId(userEmail);
+  if (!db || !userEmail || !userEmail.trim()) return () => {};
+  const normalizedTargetEmail = userEmail.trim().toLowerCase();
+  const docId = getDraftDocId(normalizedTargetEmail);
   const path = `${DRAFT_COLLECTION}/${docId}`;
   let latestSnapshotSeq = 0;
   try {
@@ -547,6 +550,11 @@ export function subscribeToFirestoreDraft(
         const data = snapshot.data();
         if (!data) return;
 
+        // Strictly verify ownerEmail matches the subscribed auditor email
+        if (data.ownerEmail && String(data.ownerEmail).trim().toLowerCase() !== normalizedTargetEmail) {
+          return;
+        }
+
         // Ignore updates originated from this exact client to prevent cursor jump/feedback loop
         if (currentClientId && data.senderClientId === currentClientId) {
           return;
@@ -555,7 +563,12 @@ export function subscribeToFirestoreDraft(
         const seq = ++latestSnapshotSeq;
 
         if (data.clearedAt && !data.factoryInfo && !data.sections) {
-          onUpdate({ clearedAt: data.clearedAt, updatedAt: data.updatedAt });
+          onUpdate({
+            clearedAt: data.clearedAt,
+            updatedAt: data.updatedAt,
+            ownerEmail: normalizedTargetEmail,
+            senderClientId: data.senderClientId,
+          });
           return;
         }
 
@@ -643,8 +656,9 @@ export async function clearFirestoreDraft(
   userEmail?: string | null,
   clientId?: string
 ): Promise<void> {
-  if (!db) return;
-  const docId = getDraftDocId(userEmail);
+  if (!db || !userEmail || !userEmail.trim()) return;
+  const normalizedEmail = userEmail.trim().toLowerCase();
+  const docId = getDraftDocId(normalizedEmail);
   const path = `${DRAFT_COLLECTION}/${docId}`;
   try {
     const docRef = doc(db, DRAFT_COLLECTION, docId);
@@ -652,7 +666,7 @@ export async function clearFirestoreDraft(
       docRef,
       sanitizeForFirestore({
         clearedAt: new Date().toISOString(),
-        ownerEmail: userEmail ? userEmail.trim().toLowerCase() : null,
+        ownerEmail: normalizedEmail,
         senderClientId: clientId || null,
         factoryInfo: null,
         sections: null,
@@ -665,7 +679,7 @@ export async function clearFirestoreDraft(
 }
 
 /**
- * Saves a completed audit report to Firestore (offloading photos if > 700KB so large reports always save)
+ * Saves a completed audit report to Firestore (offloading photos if > 200KB so large reports always save)
  */
 export async function saveAuditToFirestore(report: AuditReportData): Promise<void> {
   if (!db) return;
@@ -674,7 +688,7 @@ export async function saveAuditToFirestore(report: AuditReportData): Promise<voi
     const docRef = doc(db, AUDITS_COLLECTION, report.id);
     const approxSize = JSON.stringify(report).length;
     const payloadToSave =
-      approxSize > 700000
+      approxSize > 200000
         ? await offloadPayloadPhotos(`rep_${report.id}`, report, report.auditorEmail)
         : report;
     await setDoc(docRef, sanitizeForFirestore(payloadToSave));

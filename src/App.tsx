@@ -217,6 +217,7 @@ export default function App() {
 
   const isRemoteUpdateRef = useRef(false);
   const isInitializedRef = useRef(false);
+  const hasLocalEditsSinceMountRef = useRef(false);
   const syncTimeoutRef = useRef<any>(null);
   const editingReportIdRef = useRef<string | null>(null);
   editingReportIdRef.current = editingReportId;
@@ -225,6 +226,7 @@ export default function App() {
 
   // Refs holding latest state so mobile minimize / visibilitychange flush always saves fresh data & photos
   const latestDraftRef = useRef({
+    ownerEmail: currentUser?.email?.trim().toLowerCase() || '',
     factoryInfo,
     sections,
     currentTab,
@@ -232,19 +234,36 @@ export default function App() {
   });
   useEffect(() => {
     latestDraftRef.current = {
+      ownerEmail: currentUser?.email?.trim().toLowerCase() || '',
       factoryInfo,
       sections,
       currentTab,
       activeSectionId,
     };
-  }, [factoryInfo, sections, currentTab, activeSectionId]);
+  }, [currentUser, factoryInfo, sections, currentTab, activeSectionId]);
 
   // Sync auditor name into factory info on login
   useEffect(() => {
     if (currentUser?.name && !factoryInfo.auditorName) {
-      setFactoryInfo((prev) => ({ ...prev, auditorName: currentUser.name }));
+      setFactoryInfo((prev) => ({
+        ...prev,
+        auditorName: currentUser.name,
+        auditorTitle: prev.auditorTitle || (currentUser.role || '').replace(/\s*\(Admin\)/gi, '').trim(),
+      }));
     }
-  }, [currentUser]);
+  }, [currentUser, factoryInfo.auditorName]);
+
+  const handleLocalFactoryChange = (updated: FactoryInfo) => {
+    lastLocalEditTsRef.current = Date.now();
+    hasLocalEditsSinceMountRef.current = true;
+    setFactoryInfo(updated);
+  };
+
+  const handleLocalSectionsChange = (updated: AuditSection[]) => {
+    lastLocalEditTsRef.current = Date.now();
+    hasLocalEditsSinceMountRef.current = true;
+    setSections(updated);
+  };
 
   // Real-time saved audits subscription (Admin sees ALL auditors' reports live; auditors see ONLY their own live)
   // + Strictly Admin-only real-time subscription to ALL auditors' in-progress live drafts
@@ -326,6 +345,7 @@ export default function App() {
   ) => {
     if (!draftPayload) return;
     const isAuth = options?.isAuthoritative ?? true;
+    const targetEmail = currentUser?.email?.trim().toLowerCase() || draftPayload.ownerEmail || '';
     const merged = mergeDraftPreservingPhotos(
       latestDraftRef.current.factoryInfo,
       latestDraftRef.current.sections,
@@ -347,27 +367,28 @@ export default function App() {
     if (draftPayload.activeSectionId) {
       setActiveSectionId(draftPayload.activeSectionId);
     }
-    if (options?.persistToIdb) {
+    if (options?.persistToIdb && targetEmail) {
       saveDraftToIndexedDB(
         {
           ...draftPayload,
-          ownerEmail: currentUser?.email?.trim().toLowerCase() || draftPayload.ownerEmail,
+          ownerEmail: targetEmail,
           factoryInfo: nextFactory,
           sections: nextSections,
           updatedAt: draftPayload.updatedAt || new Date().toISOString(),
         },
-        currentUser?.email
+        targetEmail
       ).catch(() => {});
     }
     setTimeout(() => {
       isRemoteUpdateRef.current = false;
-    }, 500);
+    }, 60);
   };
 
   // Initial local IndexedDB + Firestore + Server draft reconciliation (newest timestamp wins, strictly scoped to currentUser.email)
   useEffect(() => {
-    if (!currentUser) return;
+    if (!currentUser?.email) return;
     const normalizedEmail = currentUser.email.trim().toLowerCase();
+    let cancelled = false;
     isInitializedRef.current = false;
 
     Promise.all([
@@ -376,6 +397,7 @@ export default function App() {
       fetchServerActiveDraft(normalizedEmail).catch(() => null),
     ])
       .then(([localDbDraft, firestoreDraft, serverDraft]) => {
+        if (cancelled) return;
         const candidates: Array<{ source: string; draft: any; ts: number; authoritative: boolean }> = [];
 
         const isDemoFactory = (d: any) =>
@@ -396,12 +418,16 @@ export default function App() {
         }
 
         if (firestoreDraft && (firestoreDraft.factoryInfo || firestoreDraft.sections) && !isDemoFactory(firestoreDraft)) {
-          candidates.push({
-            source: 'firestore',
-            draft: firestoreDraft,
-            ts: new Date(firestoreDraft.updatedAt || 0).getTime(),
-            authoritative: true,
-          });
+          const ownerMatch =
+            !firestoreDraft.ownerEmail || firestoreDraft.ownerEmail.trim().toLowerCase() === normalizedEmail;
+          if (ownerMatch) {
+            candidates.push({
+              source: 'firestore',
+              draft: firestoreDraft,
+              ts: new Date(firestoreDraft.updatedAt || 0).getTime(),
+              authoritative: true,
+            });
+          }
         }
 
         if (serverDraft && (serverDraft.factoryInfo || serverDraft.sections) && !isDemoFactory(serverDraft)) {
@@ -421,28 +447,48 @@ export default function App() {
           // Sort oldest to newest so newest wins cleanly while preserving local photos if needed
           candidates.sort((a, b) => a.ts - b.ts);
           const newest = candidates[candidates.length - 1];
-          applyAuthoritativeDraft(newest.draft, {
-            isAuthoritative: newest.authoritative,
-            persistToIdb: newest.source !== 'indexeddb',
-          });
+          // Never overwrite typing the user already started since mount!
+          if (!hasLocalEditsSinceMountRef.current || newest.ts > lastLocalEditTsRef.current) {
+            applyAuthoritativeDraft(newest.draft, {
+              isAuthoritative: newest.authoritative,
+              persistToIdb: newest.source !== 'indexeddb',
+            });
+          }
         }
       })
       .finally(() => {
-        isInitializedRef.current = true;
+        if (!cancelled) {
+          isInitializedRef.current = true;
+        }
       });
+
+    return () => {
+      cancelled = true;
+    };
   }, [currentUser]);
 
   // Real-time Server-Sent Events stream (when Express backend runs, scoped strictly per currentUser.email)
   useEffect(() => {
-    if (!currentUser) return;
+    if (!currentUser?.email) return;
     const normalizedEmail = currentUser.email.trim().toLowerCase();
 
     const unsubscribe = subscribeToLiveDraftStream(
       (remoteDraft) => {
         if (editingReportIdRef.current) return;
-        if (remoteDraft.ownerEmail && remoteDraft.ownerEmail.trim().toLowerCase() !== normalizedEmail) {
+        if (!remoteDraft.ownerEmail || remoteDraft.ownerEmail.trim().toLowerCase() !== normalizedEmail) {
           return;
         }
+        if (remoteDraft.senderClientId && remoteDraft.senderClientId === getClientDeviceId()) {
+          return;
+        }
+        const remoteTs = new Date(remoteDraft.updatedAt || 0).getTime();
+        if (remoteTs <= lastLocalEditTsRef.current) {
+          return;
+        }
+        if (hasLocalEditsSinceMountRef.current && Date.now() - lastLocalEditTsRef.current < 1500) {
+          return;
+        }
+
         applyAuthoritativeDraft(remoteDraft, { isAuthoritative: true, persistToIdb: true });
 
         const sender = remoteDraft.lastUpdatedBy || 'Mobile Device';
@@ -466,20 +512,38 @@ export default function App() {
 
   // Real-time Firestore Cloud Sync scoped to current user email (with full photo hydration + clear propagation)
   useEffect(() => {
-    if (!currentUser) return;
-
+    if (!currentUser?.email) return;
+    const normalizedEmail = currentUser.email.trim().toLowerCase();
     const clientId = getClientDeviceId();
+
     const unsubscribeFirestore = subscribeToFirestoreDraft(
       (remoteDraft) => {
         if (editingReportIdRef.current) return;
+        if (remoteDraft?.ownerEmail && remoteDraft.ownerEmail.trim().toLowerCase() !== normalizedEmail) {
+          return;
+        }
+        if (remoteDraft?.senderClientId && remoteDraft.senderClientId === clientId) {
+          return;
+        }
 
-        // If the other device cleared/started a new audit, mirror reset cleanly
+        const remoteTs = new Date(remoteDraft?.updatedAt || remoteDraft?.clearedAt || 0).getTime();
+        // Never overwrite local edits that are newer or made within the active typing window (1.5s)
+        if (remoteTs <= lastLocalEditTsRef.current) {
+          return;
+        }
+        if (hasLocalEditsSinceMountRef.current && Date.now() - lastLocalEditTsRef.current < 1500) {
+          return;
+        }
+
+        // If the other device cleared/started a new audit AFTER our last edit, mirror reset cleanly
         if (remoteDraft?.clearedAt && !remoteDraft.factoryInfo && !remoteDraft.sections) {
           isRemoteUpdateRef.current = true;
+          hasLocalEditsSinceMountRef.current = false;
+          lastLocalEditTsRef.current = remoteTs;
           setFactoryInfo({
             ...DEFAULT_FACTORY_DATA,
             auditorName: currentUser.name || '',
-            auditorTitle: currentUser.role || '',
+            auditorTitle: (currentUser.role || '').replace(/\s*\(Admin\)/gi, '').trim(),
             auditDate: new Date().toISOString().split('T')[0],
             certifications: DEFAULT_CERTIFICATIONS.map((c) => ({ ...c, selected: false, photo: undefined })),
             factoryOutlookPhotos: [],
@@ -491,13 +555,13 @@ export default function App() {
               checkpoints: sec.checkpoints.map((cp) => ({ ...cp, score: null, notes: '', images: [] })),
             }))
           );
-          clearDraftFromIndexedDB(currentUser.email).catch(() => {});
+          clearDraftFromIndexedDB(normalizedEmail).catch(() => {});
           try {
-            localStorage.removeItem(getLocalDraftStorageKey(currentUser.email));
+            localStorage.removeItem(getLocalDraftStorageKey(normalizedEmail));
           } catch {}
           setTimeout(() => {
             isRemoteUpdateRef.current = false;
-          }, 500);
+          }, 100);
           return;
         }
 
@@ -510,7 +574,7 @@ export default function App() {
         }, 3000);
       },
       clientId,
-      currentUser.email
+      normalizedEmail
     );
 
     return () => {
@@ -520,41 +584,57 @@ export default function App() {
 
   // Auto-save live draft on changes ONLY when working in own live audit workspace (not when editing a saved report)
   useEffect(() => {
-    if (!currentUser || !isInitializedRef.current || isRemoteUpdateRef.current || editingReportId) {
+    if (!currentUser?.email || isRemoteUpdateRef.current || editingReportId) {
+      return;
+    }
+    // Wait for initial fetch ONLY if user hasn't typed anything locally yet
+    if (!isInitializedRef.current && !hasLocalEditsSinceMountRef.current) {
       return;
     }
 
+    const email = currentUser.email.trim().toLowerCase();
     lastLocalEditTsRef.current = Date.now();
     setIsSaved(false);
     const timer = setTimeout(() => {
-      saveActiveDraft({
-        factoryInfo,
-        sections,
-        currentTab,
-        activeSectionId,
-      });
+      saveActiveDraft(
+        {
+          ownerEmail: email,
+          factoryInfo,
+          sections,
+          currentTab,
+          activeSectionId,
+        },
+        false,
+        email
+      );
       setIsSaved(true);
-    }, 300);
+    }, 200);
     return () => clearTimeout(timer);
   }, [factoryInfo, sections, currentTab, activeSectionId, currentUser, editingReportId]);
 
   // Instant flush on mobile minimize + foreground wake-up cloud re-sync on visibility/focus/online
   useEffect(() => {
-    if (!currentUser) return;
+    if (!currentUser?.email) return;
+    const email = currentUser.email.trim().toLowerCase();
+
     const flushNow = () => {
-      if (!isInitializedRef.current || editingReportIdRef.current) return;
-      saveActiveDraftImmediate(latestDraftRef.current).catch(() => {});
+      if (editingReportIdRef.current) return;
+      if (!isInitializedRef.current && !hasLocalEditsSinceMountRef.current) return;
+      const targetEmail = latestDraftRef.current.ownerEmail || email;
+      if (!targetEmail) return;
+      saveActiveDraftImmediate(latestDraftRef.current, targetEmail).catch(() => {});
     };
 
     const pullLatestOnWake = async () => {
-      if (!isInitializedRef.current || editingReportIdRef.current || !currentUser?.email) return;
+      if (!isInitializedRef.current || editingReportIdRef.current) return;
       const now = Date.now();
       if (now - lastWakeFetchTsRef.current < 1500) return;
+      if (hasLocalEditsSinceMountRef.current && now - lastLocalEditTsRef.current < 2000) return;
       lastWakeFetchTsRef.current = now;
       try {
         const [firestoreDraft, serverDraft] = await Promise.all([
-          fetchDraftFromFirestore(currentUser.email).catch(() => null),
-          fetchServerActiveDraft().catch(() => null),
+          fetchDraftFromFirestore(email).catch(() => null),
+          fetchServerActiveDraft(email).catch(() => null),
         ]);
         const remoteDraft =
           firestoreDraft && serverDraft
@@ -564,6 +644,9 @@ export default function App() {
             : firestoreDraft || serverDraft;
 
         if (remoteDraft && !editingReportIdRef.current) {
+          if (remoteDraft.senderClientId && remoteDraft.senderClientId === getClientDeviceId()) {
+            return;
+          }
           const remoteTs = new Date(remoteDraft.updatedAt || 0).getTime();
           if (remoteTs > lastLocalEditTsRef.current) {
             applyAuthoritativeDraft(remoteDraft, { isAuthoritative: true, persistToIdb: true });
@@ -605,17 +688,23 @@ export default function App() {
   const handleSyncCheckpoint = async (checkpointId: string, updatedSections: AuditSection[]) => {
     setSyncingCheckpointId(checkpointId);
     lastLocalEditTsRef.current = Date.now();
+    hasLocalEditsSinceMountRef.current = true;
     setSyncMessage('Saving Draft & Syncing Live...');
     if (syncTimeoutRef.current) clearTimeout(syncTimeoutRef.current);
 
     try {
+      const ownerEmail = currentUser?.email?.trim().toLowerCase() || '';
       if (!editingReportIdRef.current) {
-        const res = await saveActiveDraftImmediate({
-          factoryInfo: latestDraftRef.current.factoryInfo,
-          sections: updatedSections,
-          currentTab: latestDraftRef.current.currentTab,
-          activeSectionId: latestDraftRef.current.activeSectionId,
-        });
+        const res = await saveActiveDraftImmediate(
+          {
+            ownerEmail,
+            factoryInfo: latestDraftRef.current.factoryInfo,
+            sections: updatedSections,
+            currentTab: latestDraftRef.current.currentTab,
+            activeSectionId: latestDraftRef.current.activeSectionId,
+          },
+          ownerEmail
+        );
         setIsSaved(true);
         setSyncMessage(res.ok ? 'Draft Saved & Live Synced' : 'Saved Locally (Retrying Cloud)');
       } else if (!editingReportIdRef.current.startsWith('LIVE-')) {
@@ -716,15 +805,20 @@ export default function App() {
       }
     }
 
-    setFactoryInfo(updatedFactory);
-    setSections(updatedSections);
+    handleLocalFactoryChange(updatedFactory);
+    handleLocalSectionsChange(updatedSections);
     if (!editingReportId) {
-      saveActiveDraftImmediate({
-        factoryInfo: updatedFactory,
-        sections: updatedSections,
-        currentTab,
-        activeSectionId,
-      });
+      const ownerEmail = currentUser?.email?.trim().toLowerCase() || '';
+      saveActiveDraftImmediate(
+        {
+          ownerEmail,
+          factoryInfo: updatedFactory,
+          sections: updatedSections,
+          currentTab,
+          activeSectionId,
+        },
+        ownerEmail
+      );
     }
     setSyncMessage(`Photo ${action === 'copy' ? 'Copied' : 'Transferred'}`);
     setTimeout(() => setSyncMessage('Live Synced'), 2500);
@@ -735,7 +829,7 @@ export default function App() {
     try {
       const [firestoreDraft, serverDraft, refreshedAudits] = await Promise.all([
         currentUser?.email ? fetchDraftFromFirestore(currentUser.email).catch(() => null) : Promise.resolve(null),
-        fetchServerActiveDraft().catch(() => null),
+        currentUser?.email ? fetchServerActiveDraft(currentUser.email).catch(() => null) : Promise.resolve(null),
         currentUser?.email ? fetchAllAudits(currentUser.email).catch(() => null) : Promise.resolve(null),
       ]);
 
@@ -832,6 +926,7 @@ export default function App() {
 
   const resetWorkspaceState = (user: AuditorUser | null) => {
     isRemoteUpdateRef.current = true;
+    hasLocalEditsSinceMountRef.current = false;
     lastLocalEditTsRef.current = 0;
     setEditingReportId(null);
     setInspectingDraftEmail(null);
@@ -861,7 +956,7 @@ export default function App() {
     );
     setTimeout(() => {
       isRemoteUpdateRef.current = false;
-    }, 300);
+    }, 100);
   };
 
   const handleLoginSuccess = (user: AuditorUser) => {
@@ -870,10 +965,11 @@ export default function App() {
   };
 
   const handleLogout = () => {
-    if (!editingReportId && currentUser) {
-      saveActiveDraftImmediate(latestDraftRef.current).catch(() => {});
+    const email = currentUser?.email?.trim().toLowerCase();
+    if (!editingReportId && email) {
+      saveActiveDraftImmediate(latestDraftRef.current, email).catch(() => {});
     }
-    logoutAuditor();
+    logoutAuditor(email);
     setSavedAudits([]);
     setAdminLiveDrafts([]);
     resetWorkspaceState(null);
@@ -1194,6 +1290,8 @@ export default function App() {
           : cloudDraft || idbDraft;
       if (chosen && (chosen.factoryInfo || chosen.sections)) {
         isRemoteUpdateRef.current = true;
+        hasLocalEditsSinceMountRef.current = false;
+        lastLocalEditTsRef.current = new Date(chosen.updatedAt || 0).getTime();
         setFactoryInfo({
           ...DEFAULT_FACTORY_DATA,
           ...(chosen.factoryInfo || {}),
@@ -1201,7 +1299,7 @@ export default function App() {
         setSections(normalizeAuditSections(chosen.sections || DEFAULT_AUDIT_SECTIONS));
         setTimeout(() => {
           isRemoteUpdateRef.current = false;
-        }, 400);
+        }, 100);
         return;
       }
     }
@@ -1224,10 +1322,11 @@ export default function App() {
   };
 
   const handleStartNewAudit = () => {
+    const ownerEmail = currentUser?.email?.trim().toLowerCase() || '';
     const freshFactory: FactoryInfo = {
       ...DEFAULT_FACTORY_DATA,
       auditorName: currentUser?.name || '',
-      auditorTitle: currentUser?.role || '',
+      auditorTitle: (currentUser?.role || '').replace(/\s*\(Admin\)/gi, '').trim(),
       auditDate: new Date().toISOString().split('T')[0],
       auditReportNo: '',
       factoryRegistrationNo: '',
@@ -1243,9 +1342,13 @@ export default function App() {
         score: null,
         notes: '',
         images: [],
+        isUpdated: false,
       })),
     }));
 
+    isRemoteUpdateRef.current = true;
+    hasLocalEditsSinceMountRef.current = false;
+    lastLocalEditTsRef.current = Date.now();
     setInspectingDraftEmail(null);
     setEditingReportId(null);
     setCustomExecutiveSummary(null);
@@ -1253,17 +1356,28 @@ export default function App() {
     setSections(freshSections);
     setCurrentReport(null);
     setCurrentTab('pre-audit');
-    saveActiveDraft(null, true);
-    clearFirestoreDraft(currentUser?.email, getClientDeviceId()).catch(() => {});
+    saveActiveDraft(null, true, ownerEmail);
+    clearFirestoreDraft(ownerEmail, getClientDeviceId()).catch(() => {});
+    try {
+      localStorage.removeItem(getLocalDraftStorageKey(ownerEmail));
+    } catch {}
+    clearDraftFromIndexedDB(ownerEmail).catch(() => {});
+    if (ownerEmail) {
+      fetch(`/api/active-draft?email=${encodeURIComponent(ownerEmail)}`, { method: 'DELETE' }).catch(() => {});
+    }
+    setTimeout(() => {
+      isRemoteUpdateRef.current = false;
+    }, 350);
     setSyncMessage('New Audit Initialized');
     setTimeout(() => setSyncMessage('Live Synced'), 2000);
   };
 
   const handleClearAllData = async () => {
+    const ownerEmail = currentUser?.email?.trim().toLowerCase() || '';
     const cleanFactory: FactoryInfo = {
       ...DEFAULT_FACTORY_DATA,
       auditorName: currentUser?.name || '',
-      auditorTitle: currentUser?.role || '',
+      auditorTitle: (currentUser?.role || '').replace(/\s*\(Admin\)/gi, '').trim(),
       auditDate: new Date().toISOString().split('T')[0],
       auditReportNo: '',
       factoryRegistrationNo: '',
@@ -1280,9 +1394,13 @@ export default function App() {
         score: null,
         notes: '',
         images: [],
+        isUpdated: false,
       })),
     }));
 
+    isRemoteUpdateRef.current = true;
+    hasLocalEditsSinceMountRef.current = false;
+    lastLocalEditTsRef.current = Date.now();
     setInspectingDraftEmail(null);
     setEditingReportId(null);
     setCustomExecutiveSummary(null);
@@ -1292,23 +1410,26 @@ export default function App() {
     setCurrentTab('pre-audit');
 
     try {
-      localStorage.removeItem(getLocalDraftStorageKey(currentUser?.email));
+      localStorage.removeItem(getLocalDraftStorageKey(ownerEmail));
     } catch {}
 
     try {
-      await clearDraftFromIndexedDB(currentUser?.email);
+      await clearDraftFromIndexedDB(ownerEmail);
     } catch {}
 
     try {
-      if (currentUser?.email) {
-        await fetch(`/api/active-draft?email=${encodeURIComponent(currentUser.email)}`, { method: 'DELETE' });
+      if (ownerEmail) {
+        await fetch(`/api/active-draft?email=${encodeURIComponent(ownerEmail)}`, { method: 'DELETE' });
       }
     } catch {}
 
     try {
-      await clearFirestoreDraft(currentUser?.email, getClientDeviceId());
+      await clearFirestoreDraft(ownerEmail, getClientDeviceId());
     } catch {}
 
+    setTimeout(() => {
+      isRemoteUpdateRef.current = false;
+    }, 350);
     setSyncMessage('All Data Cleared & Reset');
     setTimeout(() => setSyncMessage('Live Synced'), 2500);
   };
@@ -1360,16 +1481,21 @@ export default function App() {
       ),
     };
 
-    setSections(updatedSections);
-    setFactoryInfo(updatedFactory);
+    handleLocalSectionsChange(updatedSections);
+    handleLocalFactoryChange(updatedFactory);
     setActivePreviewImage(null);
     if (!editingReportId) {
-      saveActiveDraftImmediate({
-        factoryInfo: updatedFactory,
-        sections: updatedSections,
-        currentTab,
-        activeSectionId,
-      });
+      const ownerEmail = currentUser?.email?.trim().toLowerCase() || '';
+      saveActiveDraftImmediate(
+        {
+          ownerEmail,
+          factoryInfo: updatedFactory,
+          sections: updatedSections,
+          currentTab,
+          activeSectionId,
+        },
+        ownerEmail
+      );
     }
     setSyncMessage('Photo Deleted');
     setTimeout(() => setSyncMessage('Live Synced'), 2500);
@@ -1448,7 +1574,7 @@ export default function App() {
         {currentTab === 'pre-audit' && (
           <PreAuditForm
             factoryInfo={factoryInfo}
-            onChange={setFactoryInfo}
+            onChange={handleLocalFactoryChange}
             onProceedToAudit={() => setCurrentTab('audit')}
             onOpenPreviewImage={(evidence) => setActivePreviewImage(evidence)}
             onOpenPhotoAction={handleOpenPhotoAction}
@@ -1460,7 +1586,7 @@ export default function App() {
         {currentTab === 'audit' && (
           <AuditSectionView
             sections={sections}
-            onUpdateSections={setSections}
+            onUpdateSections={handleLocalSectionsChange}
             onSubmitAndGenerateReport={handleSubmitAndGenerateReport}
             onOpenPreviewImage={setActivePreviewImage}
             onOpenPhotoAction={handleOpenPhotoAction}

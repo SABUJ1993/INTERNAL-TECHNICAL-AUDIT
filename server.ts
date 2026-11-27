@@ -122,16 +122,17 @@ let sseClients: SSEClient[] = [];
 
 function broadcastDraftUpdate(draft: any, senderClientId?: string, ownerEmail?: string | null) {
   const normalizedOwner = (ownerEmail || draft?.ownerEmail || '').trim().toLowerCase();
+  if (!normalizedOwner) return;
   const payload = JSON.stringify({
     ...(draft || {}),
-    ownerEmail: normalizedOwner || null,
+    ownerEmail: normalizedOwner,
     senderClientId,
     syncedAt: new Date().toISOString(),
   });
   const message = `event: draft_update\ndata: ${payload}\n\n`;
 
   sseClients.forEach((client) => {
-    if (normalizedOwner && client.email && client.email !== normalizedOwner) {
+    if (!client.email || client.email !== normalizedOwner) {
       return;
     }
     try {
@@ -439,26 +440,30 @@ app.get('/api/active-draft', (req, res) => {
 });
 
 app.post('/api/active-draft', (req, res) => {
-  const { factoryInfo, sections, clientId, lastUpdatedBy, ownerEmail, currentTab, activeSectionId } = req.body;
+  const { factoryInfo, sections, clientId, lastUpdatedBy, ownerEmail, currentTab, activeSectionId, updatedAt } = req.body;
   if (!factoryInfo && !sections) {
     return res.status(400).json({ error: 'Invalid draft data' });
   }
 
   const normalizedOwner = String(ownerEmail || '').trim().toLowerCase();
+  if (!normalizedOwner) {
+    return res.status(400).json({ error: 'ownerEmail is required for draft isolation' });
+  }
   const existingDraft = loadActiveDraft(normalizedOwner);
 
   const mergedFactoryInfo = factoryInfo ? { ...factoryInfo } : existingDraft?.factoryInfo || null;
   const mergedSections = sections ? [...sections] : existingDraft?.sections || null;
 
   const updatedDraft = {
-    ownerEmail: normalizedOwner || existingDraft?.ownerEmail || null,
+    ownerEmail: normalizedOwner,
     currentTab: currentTab || existingDraft?.currentTab || 'pre-audit',
     activeSectionId: activeSectionId || existingDraft?.activeSectionId || 'warehouse',
     factoryInfo: mergedFactoryInfo,
     sections: mergedSections,
     clientId: clientId || null,
+    senderClientId: clientId || null,
     lastUpdatedBy: lastUpdatedBy || 'Auditor',
-    updatedAt: new Date().toISOString(),
+    updatedAt: typeof updatedAt === 'string' && updatedAt ? updatedAt : new Date().toISOString(),
   };
 
   saveActiveDraft(updatedDraft, normalizedOwner);
@@ -473,6 +478,12 @@ app.delete('/api/active-draft', (req, res) => {
   const email = String(req.query.email || req.headers['x-auditor-email'] || '').trim().toLowerCase();
   try {
     const file = getServerDraftFile(email);
+    const pendingTimer = serverDraftTimeouts.get(file);
+    if (pendingTimer) {
+      clearTimeout(pendingTimer);
+      serverDraftTimeouts.delete(file);
+    }
+    latestDraftsToWrite.delete(file);
     if (fs.existsSync(file)) {
       fs.unlinkSync(file);
     }

@@ -8,6 +8,8 @@ import {
   Share2,
   RefreshCw,
   ClipboardCheck,
+  ShieldCheck,
+  UserCheck,
 } from 'lucide-react';
 import { AppTab, AuditorUser, ViewMode, AuditSection, CheckpointItem } from '../types/audit';
 import { isAuditorAdmin } from '../services/firebase';
@@ -116,7 +118,7 @@ export const Header: React.FC<Props> = ({
         </div>
 
         {/* Live Score, Checkpoints & Cloud Sync Status - Visible on Tablet/Desktop */}
-        <div className="hidden md:flex items-center gap-3 bg-blue-950/45 px-3 py-1.5 rounded-xl border border-blue-400/25 text-xs backdrop-blur-xs">
+        <div className="hidden lg:flex items-center gap-3 bg-blue-950/45 px-3 py-1.5 rounded-xl border border-blue-400/25 text-xs backdrop-blur-xs">
           <div className="flex items-center gap-1.5">
             <span className="text-[11px] text-blue-200 uppercase font-semibold">Score:</span>
             <span className={scoreColorText}>{currentPercentage}%</span>
@@ -155,7 +157,7 @@ export const Header: React.FC<Props> = ({
                 isLiveConnected ? 'bg-emerald-400 animate-pulse' : 'bg-amber-400'
               }`}
             />
-            <span className="font-medium text-blue-100 truncate max-w-[170px]">
+            <span className="font-medium text-blue-100 truncate max-w-[160px]">
               {syncMessage || (isSaved ? 'Live Synced' : 'Syncing...')}
             </span>
             {onManualSync && (
@@ -171,7 +173,7 @@ export const Header: React.FC<Props> = ({
           </div>
         </div>
 
-        {/* Right Actions: Share & Logout */}
+        {/* Right Actions: Signed-In User Identity (Name, Email, Role) + Share + Logout */}
         <div className="flex items-center gap-1.5 sm:gap-2 shrink-0 pr-1">
           {updateAvailable && onApplyUpdate && (
             <button
@@ -182,6 +184,40 @@ export const Header: React.FC<Props> = ({
             >
               <span>Update Available</span>
             </button>
+          )}
+
+          {/* Signed-in User Profile & Role Badge (Admin vs Auditor) */}
+          {user && (
+            <div
+              className="flex items-center gap-2 px-2 py-1 sm:px-2.5 sm:py-1 rounded-xl bg-blue-950/55 border border-blue-400/35 shadow-xs max-w-[200px] sm:max-w-[300px]"
+              title={`${user.name} (${user.email}) — ${isAdmin ? 'Admin' : 'Auditor'}`}
+            >
+              <div className="hidden sm:flex flex-col items-end leading-tight min-w-0">
+                <div className="flex items-center gap-1.5 max-w-full">
+                  <span className="text-[11px] font-extrabold text-white truncate">
+                    {user.name || user.email?.split('@')[0]}
+                  </span>
+                </div>
+                <span className="text-[10px] text-blue-200 font-mono truncate max-w-[180px]">
+                  {user.email}
+                </span>
+              </div>
+
+              <span
+                className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-lg text-[10px] font-black uppercase tracking-wide shrink-0 ${
+                  isAdmin
+                    ? 'bg-amber-400 text-slate-950 border border-amber-200 shadow-xs'
+                    : 'bg-cyan-400/95 text-slate-950 border border-cyan-200 shadow-xs'
+                }`}
+              >
+                {isAdmin ? (
+                  <ShieldCheck className="w-3 h-3 shrink-0" />
+                ) : (
+                  <UserCheck className="w-3 h-3 shrink-0" />
+                )}
+                <span>{isAdmin ? 'Admin' : 'Auditor'}</span>
+              </span>
+            </div>
           )}
 
           {onOpenShareModal && (
@@ -202,11 +238,29 @@ export const Header: React.FC<Props> = ({
               className="flex items-center gap-1 px-2.5 py-1 sm:px-3 sm:py-1.5 rounded-lg bg-rose-500/90 hover:bg-rose-600 border border-rose-300/40 text-white transition-all text-xs font-bold cursor-pointer shrink-0 shadow-xs"
             >
               <LogOut className="w-3.5 h-3.5 text-white shrink-0" />
-              <span>Logout</span>
+              <span className="hidden sm:inline">Logout</span>
             </button>
           )}
         </div>
       </div>
+
+      {/* Mobile Compact User Identity Strip */}
+      {user && (
+        <div className="sm:hidden bg-blue-950/60 border-t border-blue-500/25 px-3 py-1 flex items-center justify-between gap-2 text-[10px]">
+          <div className="flex items-center gap-1.5 min-w-0">
+            <span className="font-extrabold text-white truncate">{user.name || user.email?.split('@')[0]}</span>
+            <span className="text-blue-300">•</span>
+            <span className="font-mono text-blue-200 truncate">{user.email}</span>
+          </div>
+          <span
+            className={`px-1.5 py-0.2 rounded font-black uppercase shrink-0 ${
+              isAdmin ? 'bg-amber-400 text-slate-950' : 'bg-cyan-400 text-slate-950'
+            }`}
+          >
+            {isAdmin ? 'Admin' : 'Auditor'}
+          </span>
+        </div>
+      )}
 
       {/* Main Tab Bar Navigation: Royal Blue sub-bar with crisp active white pills */}
       <div className="bg-blue-900/90 border-t border-blue-500/30 px-3 sm:px-6 lg:px-8 xl:px-10">
