@@ -176,6 +176,12 @@ export const ReportView: React.FC<Props> = ({
               <span className="text-xs text-slate-600 font-medium">
                 Audit Date: {report.factoryInfo.auditDate || new Date().toISOString().split('T')[0]}
               </span>
+              {!report.submittedAt && (
+                <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-bold bg-emerald-50 text-emerald-700 border border-emerald-200">
+                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" />
+                  <span>Live Draft Review • Pre-Submission</span>
+                </span>
+              )}
             </div>
             <h1 className="text-xl sm:text-2xl font-black text-slate-900 tracking-tight mt-1">
               Internal Technical Audit Report

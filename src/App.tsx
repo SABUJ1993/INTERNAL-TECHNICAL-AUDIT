@@ -36,6 +36,9 @@ import {
   mergeDraftPreservingPhotos,
   fetchDraftFromFirestore,
   fetchAllActiveDraftsForAdmin,
+  subscribeToAllActiveDraftsForAdmin,
+  subscribeToAuditsForUser,
+  getLocalDraftStorageKey,
   hydratePayloadPhotos,
   saveDraftToIndexedDB,
   clearDraftFromIndexedDB,
@@ -106,7 +109,8 @@ function normalizeAuditSections(rawSections: AuditSection[]): AuditSection[] {
 export default function App() {
   const [currentUser, setCurrentUser] = useState<AuditorUser | null>(() => getCurrentUser());
   const [currentTab, setCurrentTab] = useState<AppTab>(() => {
-    const draft = loadActiveDraft();
+    const user = getCurrentUser();
+    const draft = loadActiveDraft(user?.email);
     const savedTab = draft?.currentTab;
     if (savedTab === 'pre-audit' || savedTab === 'audit' || savedTab === 'report' || savedTab === 'cap') {
       return savedTab;
@@ -125,7 +129,8 @@ export default function App() {
   } = useAppUpdate();
 
   const [factoryInfo, setFactoryInfo] = useState<FactoryInfo>(() => {
-    const draft = loadActiveDraft();
+    const user = getCurrentUser();
+    const draft = loadActiveDraft(user?.email);
     if (
       draft?.factoryInfo &&
       draft.factoryInfo.name !== 'Northern Fashions Ltd.' &&
@@ -156,7 +161,8 @@ export default function App() {
   });
 
   const [sections, setSections] = useState<AuditSection[]>(() => {
-    const draft = loadActiveDraft();
+    const user = getCurrentUser();
+    const draft = loadActiveDraft(user?.email);
     if (
       draft?.sections &&
       Array.isArray(draft.sections) &&
@@ -172,6 +178,7 @@ export default function App() {
   const [adminLiveDrafts, setAdminLiveDrafts] = useState<any[]>([]);
   const [currentReport, setCurrentReport] = useState<AuditReportData | null>(null);
   const [editingReportId, setEditingReportId] = useState<string | null>(null);
+  const [inspectingDraftEmail, setInspectingDraftEmail] = useState<string | null>(null);
   const [customExecutiveSummary, setCustomExecutiveSummary] = useState<string | null>(null);
   const [activePreviewImage, setActivePreviewImage] = useState<CheckpointEvidence | null>(null);
   const [isSaved, setIsSaved] = useState(true);
@@ -179,7 +186,8 @@ export default function App() {
   const [syncMessage, setSyncMessage] = useState<string>('Live Synced');
   const [syncingCheckpointId, setSyncingCheckpointId] = useState<string | null>(null);
   const [activeSectionId, setActiveSectionId] = useState<string>(() => {
-    const draft = loadActiveDraft();
+    const user = getCurrentUser();
+    const draft = loadActiveDraft(user?.email);
     return draft?.activeSectionId || sections[0]?.id || 'warehouse';
   });
 
@@ -238,30 +246,79 @@ export default function App() {
     }
   }, [currentUser]);
 
-  // Load saved audits & (for Admin only) live drafts across all auditors
+  // Real-time saved audits subscription (Admin sees ALL auditors' reports live; auditors see ONLY their own live)
+  // + Strictly Admin-only real-time subscription to ALL auditors' in-progress live drafts
   useEffect(() => {
-    if (currentUser?.email) {
-      fetchAllAudits(currentUser.email).then((list) => setSavedAudits(list));
-      if (isAuditorAdmin(currentUser.email)) {
-        fetchAllActiveDraftsForAdmin(currentUser.email).then((list) => setAdminLiveDrafts(list));
-      } else {
-        setAdminLiveDrafts([]);
-      }
-    } else {
+    if (!currentUser?.email) {
       setSavedAudits([]);
       setAdminLiveDrafts([]);
+      return;
     }
+
+    const email = currentUser.email.trim().toLowerCase();
+    // Initial fast fetch (merges local IndexedDB + server + Firestore)
+    fetchAllAudits(email).then((list) => setSavedAudits(list));
+
+    const unsubAudits = subscribeToAuditsForUser(email, (cloudAudits) => {
+      setSavedAudits(cloudAudits);
+    });
+
+    let unsubAdminDrafts = () => {};
+    if (isAuditorAdmin(email)) {
+      fetchAllActiveDraftsForAdmin(email).then((list) => setAdminLiveDrafts(list));
+      unsubAdminDrafts = subscribeToAllActiveDraftsForAdmin(email, (drafts) => {
+        setAdminLiveDrafts(drafts);
+      });
+    } else {
+      setAdminLiveDrafts([]);
+    }
+
+    return () => {
+      unsubAudits();
+      unsubAdminDrafts();
+    };
   }, [currentUser]);
 
-  // Refresh Admin live drafts whenever opening Saved Records tab
+  // Admin real-time live inspection: when Admin opens an auditor's live draft, keep streaming updates live
   useEffect(() => {
-    if (currentUser?.email && currentTab === 'saved-audits') {
-      fetchAllAudits(currentUser.email).then((list) => setSavedAudits(list));
-      if (isAuditorAdmin(currentUser.email)) {
-        fetchAllActiveDraftsForAdmin(currentUser.email).then((list) => setAdminLiveDrafts(list));
-      }
+    if (!currentUser?.email || !isAuditorAdmin(currentUser.email) || !inspectingDraftEmail) {
+      return;
     }
-  }, [currentTab, currentUser]);
+
+    const unsubInspect = subscribeToFirestoreDraft(
+      (remoteDraft) => {
+        if (!remoteDraft || (remoteDraft.clearedAt && !remoteDraft.factoryInfo && !remoteDraft.sections)) {
+          return;
+        }
+        const nextSections = normalizeAuditSections(remoteDraft.sections || DEFAULT_AUDIT_SECTIONS);
+        const nextFactory = {
+          ...DEFAULT_FACTORY_DATA,
+          ...(remoteDraft.factoryInfo || {}),
+        };
+        const syntheticId = `LIVE-${(remoteDraft.ownerEmail || inspectingDraftEmail).replace(/[^a-zA-Z0-9]/g, '_').toUpperCase()}`;
+        const liveReport = calculateAuditReport(nextFactory, nextSections, syntheticId, remoteDraft.updatedAt);
+        liveReport.auditorEmail = remoteDraft.ownerEmail || inspectingDraftEmail;
+        isRemoteUpdateRef.current = true;
+        setCurrentReport(liveReport);
+        setFactoryInfo(nextFactory);
+        setSections(nextSections);
+        setSyncMessage(`Live Update from ${liveReport.auditorEmail}`);
+        if (syncTimeoutRef.current) clearTimeout(syncTimeoutRef.current);
+        syncTimeoutRef.current = setTimeout(() => {
+          setSyncMessage('Live Synced');
+        }, 2500);
+        setTimeout(() => {
+          isRemoteUpdateRef.current = false;
+        }, 400);
+      },
+      undefined,
+      inspectingDraftEmail
+    );
+
+    return () => {
+      unsubInspect();
+    };
+  }, [inspectingDraftEmail, currentUser]);
 
   const applyAuthoritativeDraft = (
     draftPayload: any,
@@ -291,28 +348,32 @@ export default function App() {
       setActiveSectionId(draftPayload.activeSectionId);
     }
     if (options?.persistToIdb) {
-      saveDraftToIndexedDB({
-        ...draftPayload,
-        factoryInfo: nextFactory,
-        sections: nextSections,
-        updatedAt: draftPayload.updatedAt || new Date().toISOString(),
-      }).catch(() => {});
+      saveDraftToIndexedDB(
+        {
+          ...draftPayload,
+          ownerEmail: currentUser?.email?.trim().toLowerCase() || draftPayload.ownerEmail,
+          factoryInfo: nextFactory,
+          sections: nextSections,
+          updatedAt: draftPayload.updatedAt || new Date().toISOString(),
+        },
+        currentUser?.email
+      ).catch(() => {});
     }
     setTimeout(() => {
       isRemoteUpdateRef.current = false;
     }, 500);
   };
 
-  // Initial local IndexedDB + Firestore + Server draft reconciliation (newest timestamp wins, all photos hydrated!)
+  // Initial local IndexedDB + Firestore + Server draft reconciliation (newest timestamp wins, strictly scoped to currentUser.email)
   useEffect(() => {
     if (!currentUser) return;
     const normalizedEmail = currentUser.email.trim().toLowerCase();
     isInitializedRef.current = false;
 
     Promise.all([
-      loadActiveDraftAsync().catch(() => null),
+      loadActiveDraftAsync(normalizedEmail).catch(() => null),
       fetchDraftFromFirestore(normalizedEmail).catch(() => null),
-      fetchServerActiveDraft().catch(() => null),
+      fetchServerActiveDraft(normalizedEmail).catch(() => null),
     ])
       .then(([localDbDraft, firestoreDraft, serverDraft]) => {
         const candidates: Array<{ source: string; draft: any; ts: number; authoritative: boolean }> = [];
@@ -371,7 +432,7 @@ export default function App() {
       });
   }, [currentUser]);
 
-  // Real-time Server-Sent Events stream (when Express backend runs)
+  // Real-time Server-Sent Events stream (when Express backend runs, scoped strictly per currentUser.email)
   useEffect(() => {
     if (!currentUser) return;
     const normalizedEmail = currentUser.email.trim().toLowerCase();
@@ -393,7 +454,8 @@ export default function App() {
       },
       (connected) => {
         setIsLiveConnected(connected);
-      }
+      },
+      normalizedEmail
     );
 
     return () => {
@@ -429,9 +491,9 @@ export default function App() {
               checkpoints: sec.checkpoints.map((cp) => ({ ...cp, score: null, notes: '', images: [] })),
             }))
           );
-          clearDraftFromIndexedDB().catch(() => {});
+          clearDraftFromIndexedDB(currentUser.email).catch(() => {});
           try {
-            localStorage.removeItem('qualitech_active_audit_v1');
+            localStorage.removeItem(getLocalDraftStorageKey(currentUser.email));
           } catch {}
           setTimeout(() => {
             isRemoteUpdateRef.current = false;
@@ -768,26 +830,53 @@ export default function App() {
     [activeCapItems]
   );
 
-  const handleLoginSuccess = (user: AuditorUser) => {
-    setCurrentUser(user);
+  const resetWorkspaceState = (user: AuditorUser | null) => {
+    isRemoteUpdateRef.current = true;
+    lastLocalEditTsRef.current = 0;
     setEditingReportId(null);
+    setInspectingDraftEmail(null);
     setCurrentReport(null);
     setCustomExecutiveSummary(null);
-    setFactoryInfo((prev) => ({
-      ...prev,
-      auditorName: user.name || prev.auditorName || '',
-      auditorTitle: (user.role || prev.auditorTitle || '').replace(/\s*\(Admin\)/gi, '').trim(),
-    }));
+    setCurrentTab('pre-audit');
+    setFactoryInfo({
+      ...DEFAULT_FACTORY_DATA,
+      auditorName: user?.name || '',
+      auditorTitle: (user?.role || '').replace(/\s*\(Admin\)/gi, '').trim(),
+      auditDate: new Date().toISOString().split('T')[0],
+      certifications: DEFAULT_CERTIFICATIONS.map((c) => ({ ...c, selected: false, photo: undefined })),
+      factoryOutlookPhotos: [],
+      contactEmails: [],
+    });
+    setSections(
+      DEFAULT_AUDIT_SECTIONS.map((sec) => ({
+        ...sec,
+        checkpoints: sec.checkpoints.map((cp) => ({
+          ...cp,
+          score: null,
+          notes: '',
+          images: [],
+          isUpdated: false,
+        })),
+      }))
+    );
+    setTimeout(() => {
+      isRemoteUpdateRef.current = false;
+    }, 300);
+  };
+
+  const handleLoginSuccess = (user: AuditorUser) => {
+    resetWorkspaceState(user);
+    setCurrentUser(user);
   };
 
   const handleLogout = () => {
-    if (!editingReportId) {
-      saveActiveDraftImmediate(latestDraftRef.current);
+    if (!editingReportId && currentUser) {
+      saveActiveDraftImmediate(latestDraftRef.current).catch(() => {});
     }
     logoutAuditor();
-    setEditingReportId(null);
-    setCurrentReport(null);
-    setCustomExecutiveSummary(null);
+    setSavedAudits([]);
+    setAdminLiveDrafts([]);
+    resetWorkspaceState(null);
     setCurrentUser(null);
   };
 
@@ -1027,6 +1116,7 @@ export default function App() {
   };
 
   const handleLoadAudit = (audit: AuditReportData) => {
+    setInspectingDraftEmail(null);
     setEditingReportId(audit.id);
     setCurrentReport(audit);
     setCustomExecutiveSummary(audit.executiveSummary || null);
@@ -1037,6 +1127,7 @@ export default function App() {
   };
 
   const handleEditAudit = (audit: AuditReportData) => {
+    setInspectingDraftEmail(null);
     setEditingReportId(audit.id);
     setCurrentReport(audit);
     setCustomExecutiveSummary(audit.executiveSummary || null);
@@ -1047,6 +1138,7 @@ export default function App() {
   };
 
   const handleOpenCapForAudit = (audit: AuditReportData) => {
+    setInspectingDraftEmail(null);
     setEditingReportId(audit.id);
     setCurrentReport(audit);
     setCustomExecutiveSummary(audit.executiveSummary || null);
@@ -1056,26 +1148,33 @@ export default function App() {
     window.scrollTo({ top: 0, behavior: 'smooth' });
   };
 
-  const handleInspectLiveDraft = async (draft: any) => {
+  const handleInspectLiveDraft = async (draft: any, targetTab: 'report' | 'audit' = 'report') => {
     const hydrated = await hydratePayloadPhotos(draft);
     const draftSections = normalizeAuditSections(hydrated.sections || DEFAULT_AUDIT_SECTIONS);
     const draftFactory = {
       ...DEFAULT_FACTORY_DATA,
       ...(hydrated.factoryInfo || {}),
     };
-    const syntheticId = `LIVE-${(hydrated.ownerEmail || 'AUDITOR').replace(/[^a-zA-Z0-9]/g, '_').toUpperCase()}`;
+    const ownerEmail = (hydrated.ownerEmail || '').trim().toLowerCase();
+    const syntheticId = `LIVE-${(ownerEmail || 'AUDITOR').replace(/[^a-zA-Z0-9]/g, '_').toUpperCase()}`;
     const liveReport = calculateAuditReport(draftFactory, draftSections, syntheticId, hydrated.updatedAt);
-    liveReport.auditorEmail = hydrated.ownerEmail || '';
+    liveReport.auditorEmail = ownerEmail;
+    isRemoteUpdateRef.current = true;
+    setInspectingDraftEmail(ownerEmail || null);
     setEditingReportId(syntheticId);
     setCurrentReport(liveReport);
     setCustomExecutiveSummary(null);
     setFactoryInfo(draftFactory);
     setSections(draftSections);
-    setCurrentTab('report');
+    setCurrentTab(targetTab);
     window.scrollTo({ top: 0, behavior: 'smooth' });
+    setTimeout(() => {
+      isRemoteUpdateRef.current = false;
+    }, 300);
   };
 
   const handleExitSavedReportWorkspace = async () => {
+    setInspectingDraftEmail(null);
     setEditingReportId(null);
     setCurrentReport(null);
     setCustomExecutiveSummary(null);
@@ -1085,7 +1184,7 @@ export default function App() {
       const normalized = currentUser.email.trim().toLowerCase();
       const [cloudDraft, idbDraft] = await Promise.all([
         fetchDraftFromFirestore(normalized).catch(() => null),
-        loadActiveDraftAsync().catch(() => null),
+        loadActiveDraftAsync(normalized).catch(() => null),
       ]);
       const chosen =
         cloudDraft && idbDraft
@@ -1147,6 +1246,7 @@ export default function App() {
       })),
     }));
 
+    setInspectingDraftEmail(null);
     setEditingReportId(null);
     setCustomExecutiveSummary(null);
     setFactoryInfo(freshFactory);
@@ -1183,6 +1283,7 @@ export default function App() {
       })),
     }));
 
+    setInspectingDraftEmail(null);
     setEditingReportId(null);
     setCustomExecutiveSummary(null);
     setFactoryInfo(cleanFactory);
@@ -1191,15 +1292,17 @@ export default function App() {
     setCurrentTab('pre-audit');
 
     try {
-      localStorage.removeItem('qualitech_active_audit_v1');
+      localStorage.removeItem(getLocalDraftStorageKey(currentUser?.email));
     } catch {}
 
     try {
-      await clearDraftFromIndexedDB();
+      await clearDraftFromIndexedDB(currentUser?.email);
     } catch {}
 
     try {
-      await fetch('/api/active-draft', { method: 'DELETE' });
+      if (currentUser?.email) {
+        await fetch(`/api/active-draft?email=${encodeURIComponent(currentUser.email)}`, { method: 'DELETE' });
+      }
     } catch {}
 
     try {
@@ -1298,6 +1401,7 @@ export default function App() {
         onApplyUpdate={applyUpdate}
         openCapCount={openCapCount}
         totalCapCount={activeCapItems.length}
+        liveDraftCount={adminLiveDrafts.length}
       />
 
       {/* Main Tab Content */}
@@ -1305,8 +1409,11 @@ export default function App() {
         {editingReportId && currentTab !== 'saved-audits' && (
           <div className="mb-4 bg-indigo-900 text-white rounded-2xl px-4 py-2.5 shadow-md flex flex-col sm:flex-row sm:items-center justify-between gap-2 text-xs">
             <div className="flex flex-wrap items-center gap-2">
-              <span className="px-2 py-0.5 rounded bg-indigo-700 font-mono font-bold text-[10px] uppercase">
-                {editingReportId.startsWith('LIVE-') ? 'Live Draft Preview' : 'Saved Report Mode'}
+              <span className="px-2 py-0.5 rounded bg-indigo-700 font-mono font-bold text-[10px] uppercase flex items-center gap-1.5">
+                {editingReportId.startsWith('LIVE-') && (
+                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
+                )}
+                <span>{editingReportId.startsWith('LIVE-') ? 'Live Auditor Stream' : 'Saved Report Mode'}</span>
               </span>
               <span className="font-bold">
                 {factoryInfo.name || 'Factory Report'}

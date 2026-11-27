@@ -64,10 +64,25 @@ function saveUsers(users: any[]) {
   }
 }
 
-function loadActiveDraft(): any | null {
+const DRAFTS_DIR = path.join(DATA_DIR, 'drafts');
+if (!fs.existsSync(DRAFTS_DIR)) {
   try {
-    if (fs.existsSync(DRAFT_FILE)) {
-      return JSON.parse(fs.readFileSync(DRAFT_FILE, 'utf-8'));
+    fs.mkdirSync(DRAFTS_DIR, { recursive: true });
+  } catch {}
+}
+
+function getServerDraftFile(email?: string | null): string {
+  const normalized = (email || '').trim().toLowerCase();
+  if (!normalized) return DRAFT_FILE;
+  const safe = normalized.replace(/[^a-z0-9]/g, '_');
+  return path.join(DRAFTS_DIR, `draft_${safe}.json`);
+}
+
+function loadActiveDraft(email?: string | null): any | null {
+  try {
+    const file = getServerDraftFile(email);
+    if (fs.existsSync(file)) {
+      return JSON.parse(fs.readFileSync(file, 'utf-8'));
     }
   } catch (err) {
     console.error('Failed reading active draft file', err);
@@ -75,44 +90,53 @@ function loadActiveDraft(): any | null {
   return null;
 }
 
-let serverDraftTimeout: NodeJS.Timeout | null = null;
-let latestDraftToWrite: any = null;
+const serverDraftTimeouts = new Map<string, NodeJS.Timeout>();
+const latestDraftsToWrite = new Map<string, any>();
 
-function saveActiveDraft(draft: any) {
-  latestDraftToWrite = draft;
-  if (serverDraftTimeout) return;
-  serverDraftTimeout = setTimeout(() => {
-    serverDraftTimeout = null;
-    if (!latestDraftToWrite) return;
+function saveActiveDraft(draft: any, email?: string | null) {
+  const file = getServerDraftFile(email || draft?.ownerEmail);
+  latestDraftsToWrite.set(file, draft);
+  if (serverDraftTimeouts.has(file)) return;
+  const timer = setTimeout(() => {
+    serverDraftTimeouts.delete(file);
+    const data = latestDraftsToWrite.get(file);
+    if (!data) return;
     try {
-      fs.writeFile(DRAFT_FILE, JSON.stringify(latestDraftToWrite), 'utf-8', (err) => {
+      fs.writeFile(file, JSON.stringify(data), 'utf-8', (err) => {
         if (err) console.error('Failed writing active draft file', err);
       });
     } catch (err) {
       console.error('Failed writing active draft file', err);
     }
-  }, 1000);
+  }, 500);
+  serverDraftTimeouts.set(file, timer);
 }
 
-// SSE Real-Time Clients Registry
+// SSE Real-Time Clients Registry (scoped per email)
 interface SSEClient {
   id: string;
+  email: string;
   res: express.Response;
 }
 let sseClients: SSEClient[] = [];
 
-function broadcastDraftUpdate(draft: any, senderClientId?: string) {
+function broadcastDraftUpdate(draft: any, senderClientId?: string, ownerEmail?: string | null) {
+  const normalizedOwner = (ownerEmail || draft?.ownerEmail || '').trim().toLowerCase();
   const payload = JSON.stringify({
-    ...draft,
+    ...(draft || {}),
+    ownerEmail: normalizedOwner || null,
     senderClientId,
     syncedAt: new Date().toISOString(),
   });
   const message = `event: draft_update\ndata: ${payload}\n\n`;
 
   sseClients.forEach((client) => {
+    if (normalizedOwner && client.email && client.email !== normalizedOwner) {
+      return;
+    }
     try {
       client.res.write(message);
-    } catch (e) {
+    } catch {
       // client disconnected
     }
   });
@@ -380,7 +404,7 @@ app.post('/api/auth/forgot-password/reset', (req, res) => {
   });
 });
 
-// REAL-TIME SSE SYNC STREAM (Multi-Device Live Sync)
+// REAL-TIME SSE SYNC STREAM (Multi-Device Live Sync, isolated per auditor email)
 app.get('/api/active-draft/stream', (req, res) => {
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache, no-transform');
@@ -388,12 +412,13 @@ app.get('/api/active-draft/stream', (req, res) => {
   res.setHeader('X-Accel-Buffering', 'no');
   res.flushHeaders?.();
 
+  const clientEmail = String(req.query.email || '').trim().toLowerCase();
   const clientId = `client_${Date.now()}_${Math.random().toString(36).substring(7)}`;
-  const newClient: SSEClient = { id: clientId, res };
+  const newClient: SSEClient = { id: clientId, email: clientEmail, res };
   sseClients.push(newClient);
 
-  // Send initial current draft immediately upon connection
-  const currentDraft = loadActiveDraft();
+  // Send initial current draft immediately ONLY for this email
+  const currentDraft = clientEmail ? loadActiveDraft(clientEmail) : null;
   if (currentDraft) {
     res.write(`event: initial_state\ndata: ${JSON.stringify(currentDraft)}\n\n`);
   } else {
@@ -405,25 +430,30 @@ app.get('/api/active-draft/stream', (req, res) => {
   });
 });
 
-// Active Draft Endpoints (Live Cloud Sync between Mobile & PC)
+// Active Draft Endpoints (Live Cloud Sync between Mobile & PC, isolated per auditor email)
 app.get('/api/active-draft', (req, res) => {
-  const draft = loadActiveDraft();
+  const email = String(req.query.email || req.headers['x-auditor-email'] || '').trim().toLowerCase();
+  if (!email) return res.json(null);
+  const draft = loadActiveDraft(email);
   res.json(draft || null);
 });
 
 app.post('/api/active-draft', (req, res) => {
-  const { factoryInfo, sections, clientId, lastUpdatedBy, ownerEmail } = req.body;
+  const { factoryInfo, sections, clientId, lastUpdatedBy, ownerEmail, currentTab, activeSectionId } = req.body;
   if (!factoryInfo && !sections) {
     return res.status(400).json({ error: 'Invalid draft data' });
   }
 
-  const existingDraft = loadActiveDraft();
+  const normalizedOwner = String(ownerEmail || '').trim().toLowerCase();
+  const existingDraft = loadActiveDraft(normalizedOwner);
 
   const mergedFactoryInfo = factoryInfo ? { ...factoryInfo } : existingDraft?.factoryInfo || null;
   const mergedSections = sections ? [...sections] : existingDraft?.sections || null;
 
   const updatedDraft = {
-    ownerEmail: ownerEmail || existingDraft?.ownerEmail || null,
+    ownerEmail: normalizedOwner || existingDraft?.ownerEmail || null,
+    currentTab: currentTab || existingDraft?.currentTab || 'pre-audit',
+    activeSectionId: activeSectionId || existingDraft?.activeSectionId || 'warehouse',
     factoryInfo: mergedFactoryInfo,
     sections: mergedSections,
     clientId: clientId || null,
@@ -431,23 +461,27 @@ app.post('/api/active-draft', (req, res) => {
     updatedAt: new Date().toISOString(),
   };
 
-  saveActiveDraft(updatedDraft);
+  saveActiveDraft(updatedDraft, normalizedOwner);
 
-  // Broadcast in real-time to all other open browsers/devices
-  broadcastDraftUpdate(updatedDraft, clientId);
+  // Broadcast in real-time ONLY to other devices logged into the same email
+  broadcastDraftUpdate(updatedDraft, clientId, normalizedOwner);
 
   res.json({ success: true, updatedAt: updatedDraft.updatedAt });
 });
 
 app.delete('/api/active-draft', (req, res) => {
+  const email = String(req.query.email || req.headers['x-auditor-email'] || '').trim().toLowerCase();
   try {
-    if (fs.existsSync(DRAFT_FILE)) {
-      fs.unlinkSync(DRAFT_FILE);
+    const file = getServerDraftFile(email);
+    if (fs.existsSync(file)) {
+      fs.unlinkSync(file);
     }
   } catch (e) {
     console.error('Error removing active draft file', e);
   }
-  broadcastDraftUpdate(null);
+  if (email) {
+    broadcastDraftUpdate({ clearedAt: new Date().toISOString(), factoryInfo: null, sections: null }, undefined, email);
+  }
   res.json({ success: true, message: 'Active draft reset successfully' });
 });
 

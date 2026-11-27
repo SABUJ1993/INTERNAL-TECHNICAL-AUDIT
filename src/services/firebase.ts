@@ -601,6 +601,42 @@ export async function fetchAllActiveDraftsForAdmin(requesterEmail?: string | nul
 }
 
 /**
+ * Strictly Admin-only: Real-time subscription to ALL auditors' live in-progress drafts.
+ * Regular auditors get an instant no-op unsubscribe and never see any other user's draft.
+ */
+export function subscribeToAllActiveDraftsForAdmin(
+  requesterEmail: string | null | undefined,
+  onUpdate: (drafts: any[]) => void
+): Unsubscribe {
+  if (!db || !isAuditorAdmin(requesterEmail)) return () => {};
+  try {
+    const colRef = collection(db, DRAFT_COLLECTION);
+    return onSnapshot(
+      colRef,
+      (snap) => {
+        const list: any[] = [];
+        snap.forEach((d) => {
+          const data = d.data();
+          if (data && !data.clearedAt && (data.factoryInfo || data.sections)) {
+            list.push({ id: d.id, ...data });
+          }
+        });
+        list.sort(
+          (a, b) => new Date(b.updatedAt || 0).getTime() - new Date(a.updatedAt || 0).getTime()
+        );
+        onUpdate(list);
+      },
+      (error) => {
+        logFirestoreError(error, OperationType.LIST, DRAFT_COLLECTION);
+      }
+    );
+  } catch (err) {
+    logFirestoreError(err, OperationType.LIST, DRAFT_COLLECTION);
+    return () => {};
+  }
+}
+
+/**
  * Clears the active draft in Firestore (notifies other signed-in devices of same email)
  */
 export async function clearFirestoreDraft(
@@ -677,6 +713,53 @@ export async function fetchAuditsFromFirestore(requesterEmail?: string): Promise
 }
 
 /**
+ * Real-time subscription to submitted audit reports & CAP updates:
+ * - Admin (quality.bd.eng@gmail.com) receives ALL auditors' reports live
+ * - Regular auditors strictly receive ONLY their own submitted reports live
+ */
+export function subscribeToAuditsForUser(
+  requesterEmail: string | null | undefined,
+  onUpdate: (audits: AuditReportData[]) => void
+): Unsubscribe {
+  if (!db || !requesterEmail) return () => {};
+  const normalizedRequester = requesterEmail.trim().toLowerCase();
+  const adminAccess = isAuditorAdmin(normalizedRequester);
+  let latestSeq = 0;
+
+  try {
+    const colRef = collection(db, AUDITS_COLLECTION);
+    return onSnapshot(
+      colRef,
+      async (snap) => {
+        const seq = ++latestSeq;
+        const rawAudits: AuditReportData[] = [];
+        snap.forEach((d) => {
+          const data = d.data() as AuditReportData;
+          if (!data || !data.id) return;
+          if (adminAccess) {
+            rawAudits.push(data);
+          } else if (data.auditorEmail && data.auditorEmail.trim().toLowerCase() === normalizedRequester) {
+            rawAudits.push(data);
+          }
+        });
+        const hydrated = await Promise.all(rawAudits.map((a) => hydratePayloadPhotos(a)));
+        if (seq !== latestSeq) return;
+        hydrated.sort(
+          (a, b) => new Date(b.updatedAt || b.createdAt).getTime() - new Date(a.updatedAt || a.createdAt).getTime()
+        );
+        onUpdate(hydrated);
+      },
+      (error) => {
+        logFirestoreError(error, OperationType.LIST, AUDITS_COLLECTION);
+      }
+    );
+  } catch (err) {
+    logFirestoreError(err, OperationType.LIST, AUDITS_COLLECTION);
+    return () => {};
+  }
+}
+
+/**
  * Deletes an audit record from Firestore
  * Strictly restricted to Admin: quality.bd.eng@gmail.com
  */
@@ -726,7 +809,7 @@ export async function firestoreRegisterUser(params: {
     isVerified: true,
   };
 
-  await setDoc(userRef, userData);
+  await setDoc(userRef, sanitizeForFirestore(userData));
   return userData;
 }
 
@@ -775,12 +858,15 @@ export async function firestoreRequestPasswordReset(email: string): Promise<stri
     try {
       const docId = normalizedEmail.replace(/[^a-z0-9]/g, '_');
       const resetRef = doc(db, RESET_OTP_COLLECTION, docId);
-      await setDoc(resetRef, {
-        email: normalizedEmail,
-        code,
-        expiresAt: Date.now() + 15 * 60 * 1000, // 15 mins
-        createdAt: new Date().toISOString(),
-      });
+      await setDoc(
+        resetRef,
+        sanitizeForFirestore({
+          email: normalizedEmail,
+          code,
+          expiresAt: Date.now() + 15 * 60 * 1000, // 15 mins
+          createdAt: new Date().toISOString(),
+        })
+      );
     } catch (err) {
       console.warn('Firestore reset OTP store failed', err);
     }
@@ -831,18 +917,21 @@ export async function firestoreResetUserPassword(
   const userSnap = await getDoc(userRef);
 
   if (userSnap.exists()) {
-    await setDoc(userRef, { password: trimmedNewPass }, { merge: true });
+    await setDoc(userRef, sanitizeForFirestore({ password: trimmedNewPass }), { merge: true });
   } else {
-    await setDoc(userRef, {
-      id: `aud-${Date.now()}`,
-      name: normalizedEmail.split('@')[0],
-      email: normalizedEmail,
-      username: normalizedEmail,
-      password: trimmedNewPass,
-      role: 'Lead QMS Auditor',
-      updatedAt: new Date().toISOString(),
-      isVerified: true,
-    });
+    await setDoc(
+      userRef,
+      sanitizeForFirestore({
+        id: `aud-${Date.now()}`,
+        name: normalizedEmail.split('@')[0],
+        email: normalizedEmail,
+        username: normalizedEmail,
+        password: trimmedNewPass,
+        role: 'Lead QMS Auditor',
+        updatedAt: new Date().toISOString(),
+        isVerified: true,
+      })
+    );
   }
 
   await deleteDoc(resetRef);

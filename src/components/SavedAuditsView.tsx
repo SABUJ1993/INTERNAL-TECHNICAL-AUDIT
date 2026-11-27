@@ -27,7 +27,7 @@ interface Props {
   onLoadAudit: (audit: AuditReportData) => void;
   onEditAudit?: (audit: AuditReportData) => void;
   onOpenCap: (audit: AuditReportData) => void;
-  onInspectLiveDraft?: (draft: any) => void;
+  onInspectLiveDraft?: (draft: any, targetTab?: 'report' | 'audit') => void;
   onDeleteAudit: (id: string) => void;
   onStartNewAudit: () => void;
   currentUser?: AuditorUser | null;
@@ -137,9 +137,9 @@ export const SavedAuditsView: React.FC<Props> = ({
         </button>
       </div>
 
-      {/* Admin Live Active Drafts Across All Auditors */}
-      {isAdmin && liveDrafts.length > 0 && (
-        <div className="bg-gradient-to-br from-indigo-50/70 via-white to-blue-50/60 rounded-2xl p-4 sm:p-5 border border-indigo-200 shadow-sm space-y-3">
+      {/* Admin Live Active Drafts Across All Auditors (Real-Time) */}
+      {isAdmin && (
+        <div className="bg-gradient-to-br from-indigo-50/80 via-white to-blue-50/70 rounded-2xl p-4 sm:p-5 border border-indigo-200 shadow-sm space-y-3">
           <div className="flex items-center justify-between gap-2 flex-wrap">
             <div className="flex items-center gap-2">
               <span className="w-2.5 h-2.5 rounded-full bg-emerald-500 animate-pulse" />
@@ -149,59 +149,83 @@ export const SavedAuditsView: React.FC<Props> = ({
               </h2>
             </div>
             <span className="text-[11px] font-semibold text-indigo-700">
-              Admin-only live view across all auditor emails
+              Admin-only real-time monitor across all auditor emails
             </span>
           </div>
 
-          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
-            {liveDrafts.map((draft) => {
-              const owner = draft.ownerEmail || 'Unknown Auditor';
-              const fName = draft.factoryInfo?.name || 'Untitled Factory Draft';
-              const sections: any[] = Array.isArray(draft.sections) ? draft.sections : [];
-              const totalCp = sections.reduce((acc, s) => acc + (s.checkpoints?.length || 0), 0);
-              const evalCp = sections.reduce(
-                (acc, s) => acc + (s.checkpoints?.filter((c: any) => c.score)?.length || 0),
-                0
-              );
-              const updatedStr = draft.updatedAt
-                ? new Date(draft.updatedAt).toLocaleString()
-                : 'Just now';
+          {liveDrafts.length === 0 ? (
+            <div className="bg-white/80 rounded-xl p-4 border border-indigo-100 text-xs text-slate-500 flex items-center gap-2">
+              <Radio className="w-4 h-4 text-indigo-400 shrink-0" />
+              <span>
+                No active in-progress drafts at the moment. As soon as any auditor begins or updates an audit on Mobile or PC, it will appear here live.
+              </span>
+            </div>
+          ) : (
+            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
+              {liveDrafts.map((draft) => {
+                const owner = draft.ownerEmail || 'Unknown Auditor';
+                const fName = draft.factoryInfo?.name || 'Untitled Factory Draft';
+                const sections: any[] = Array.isArray(draft.sections) ? draft.sections : [];
+                const totalCp = sections.reduce((acc, s) => acc + (s.checkpoints?.length || 0), 0);
+                const evalCp = sections.reduce(
+                  (acc, s) => acc + (s.checkpoints?.filter((c: any) => c.score)?.length || 0),
+                  0
+                );
+                const photoCount = sections.reduce(
+                  (acc, s) =>
+                    acc +
+                    (s.checkpoints?.reduce((cAcc: number, c: any) => cAcc + (c.images?.length || 0), 0) || 0),
+                  0
+                );
+                const updatedStr = draft.updatedAt
+                  ? new Date(draft.updatedAt).toLocaleString()
+                  : 'Just now';
 
-              return (
-                <div
-                  key={draft.id || owner}
-                  className="bg-white rounded-xl p-3.5 border border-indigo-200 shadow-xs flex flex-col justify-between gap-2.5"
-                >
-                  <div className="space-y-1">
-                    <div className="flex items-center justify-between gap-2">
-                      <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-indigo-50 text-indigo-800 border border-indigo-200 text-[10px] font-bold truncate max-w-[210px]">
-                        <Mail className="w-3 h-3 shrink-0" />
-                        <span className="truncate">{owner}</span>
-                      </span>
-                      <span className="text-[10px] font-bold text-emerald-700 bg-emerald-50 px-2 py-0.5 rounded">
-                        {evalCp}/{totalCp} Checked
-                      </span>
+                return (
+                  <div
+                    key={draft.id || owner}
+                    className="bg-white rounded-xl p-3.5 border border-indigo-200 shadow-xs flex flex-col justify-between gap-2.5"
+                  >
+                    <div className="space-y-1">
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-indigo-50 text-indigo-800 border border-indigo-200 text-[10px] font-bold truncate max-w-[200px]">
+                          <Mail className="w-3 h-3 shrink-0" />
+                          <span className="truncate">{owner}</span>
+                        </span>
+                        <span className="text-[10px] font-bold text-emerald-700 bg-emerald-50 px-2 py-0.5 rounded shrink-0">
+                          {evalCp}/{totalCp} • {photoCount} Photos
+                        </span>
+                      </div>
+                      <h3 className="text-sm font-bold text-slate-900 truncate">{fName}</h3>
+                      <p className="text-[11px] text-slate-500">
+                        Auditor: <strong className="text-slate-700">{draft.factoryInfo?.auditorName || 'In Progress'}</strong> • {updatedStr}
+                      </p>
                     </div>
-                    <h3 className="text-sm font-bold text-slate-900 truncate">{fName}</h3>
-                    <p className="text-[11px] text-slate-500">
-                      Auditor: <strong className="text-slate-700">{draft.factoryInfo?.auditorName || 'In Progress'}</strong> • {updatedStr}
-                    </p>
-                  </div>
 
-                  {onInspectLiveDraft && (
-                    <button
-                      type="button"
-                      onClick={() => onInspectLiveDraft(draft)}
-                      className="w-full py-1.5 px-3 rounded-lg bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-bold flex items-center justify-center gap-1.5 cursor-pointer transition-colors"
-                    >
-                      <span>Inspect / Review Live Draft</span>
-                      <ArrowRight className="w-3.5 h-3.5" />
-                    </button>
-                  )}
-                </div>
-              );
-            })}
-          </div>
+                    {onInspectLiveDraft && (
+                      <div className="grid grid-cols-2 gap-1.5">
+                        <button
+                          type="button"
+                          onClick={() => onInspectLiveDraft(draft, 'audit')}
+                          className="py-1.5 px-2.5 rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-800 text-xs font-bold flex items-center justify-center gap-1 cursor-pointer transition-colors"
+                        >
+                          <span>Live Checkpoints</span>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => onInspectLiveDraft(draft, 'report')}
+                          className="py-1.5 px-2.5 rounded-lg bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-bold flex items-center justify-center gap-1 cursor-pointer transition-colors"
+                        >
+                          <span>Live Report</span>
+                          <ArrowRight className="w-3.5 h-3.5" />
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          )}
         </div>
       )}
 

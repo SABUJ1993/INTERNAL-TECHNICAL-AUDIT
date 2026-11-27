@@ -60,17 +60,26 @@ function openDatabase(): Promise<IDBDatabase> {
   return cachedDbPromise;
 }
 
+function getDraftKey(userEmail?: string | null): string {
+  if (userEmail && userEmail.trim()) {
+    return `draft_${userEmail.trim().toLowerCase().replace(/[^a-z0-9]/g, '_')}`;
+  }
+  return 'current_active_draft';
+}
+
 /**
- * Persists the entire active audit draft (including 500+ photos) safely in IndexedDB
+ * Persists the entire active audit draft (including 500+ photos) safely in IndexedDB,
+ * strictly isolated per auditor email.
  */
-export async function saveDraftToIndexedDB(draft: any): Promise<void> {
+export async function saveDraftToIndexedDB(draft: any, userEmail?: string | null): Promise<void> {
   if (!isIndexedDBAvailable()) return;
+  const key = getDraftKey(userEmail || draft?.ownerEmail);
   try {
     const db = await openDatabase();
     return new Promise((resolve, reject) => {
       const tx = db.transaction(DRAFT_STORE, 'readwrite');
       const store = tx.objectStore(DRAFT_STORE);
-      const req = store.put(draft, 'current_active_draft');
+      const req = store.put(draft, key);
 
       req.onsuccess = () => resolve();
       req.onerror = () => reject(req.error);
@@ -81,16 +90,17 @@ export async function saveDraftToIndexedDB(draft: any): Promise<void> {
 }
 
 /**
- * Loads the active draft from IndexedDB
+ * Loads the active draft from IndexedDB for the specific auditor email
  */
-export async function loadDraftFromIndexedDB(): Promise<any | null> {
+export async function loadDraftFromIndexedDB(userEmail?: string | null): Promise<any | null> {
   if (!isIndexedDBAvailable()) return null;
+  const key = getDraftKey(userEmail);
   try {
     const db = await openDatabase();
     return new Promise((resolve, reject) => {
       const tx = db.transaction(DRAFT_STORE, 'readonly');
       const store = tx.objectStore(DRAFT_STORE);
-      const req = store.get('current_active_draft');
+      const req = store.get(key);
 
       req.onsuccess = () => resolve(req.result || null);
       req.onerror = () => reject(req.error);
@@ -102,16 +112,17 @@ export async function loadDraftFromIndexedDB(): Promise<any | null> {
 }
 
 /**
- * Completely clears the active draft from IndexedDB
+ * Completely clears the active draft from IndexedDB for the specific auditor email
  */
-export async function clearDraftFromIndexedDB(): Promise<void> {
+export async function clearDraftFromIndexedDB(userEmail?: string | null): Promise<void> {
   if (!isIndexedDBAvailable()) return;
+  const key = getDraftKey(userEmail);
   try {
     const db = await openDatabase();
     return new Promise((resolve, reject) => {
       const tx = db.transaction(DRAFT_STORE, 'readwrite');
       const store = tx.objectStore(DRAFT_STORE);
-      const req = store.delete('current_active_draft');
+      const req = store.delete(key);
 
       req.onsuccess = () => resolve();
       req.onerror = () => reject(req.error);

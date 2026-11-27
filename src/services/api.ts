@@ -12,9 +12,11 @@ import {
   clearFirestoreDraft,
   fetchDraftFromFirestore,
   fetchAllActiveDraftsForAdmin,
+  subscribeToAllActiveDraftsForAdmin,
   hydratePayloadPhotos,
   saveAuditToFirestore,
   fetchAuditsFromFirestore,
+  subscribeToAuditsForUser,
   deleteAuditFromFirestore,
   subscribeToFirestoreDraft,
   firestoreRegisterUser,
@@ -665,13 +667,22 @@ export async function deleteAuditReport(id: string, requesterEmail?: string): Pr
 
 let cloudSyncTimer: any = null;
 
-function writeLightLocalDraft(draft: any): void {
+export function getLocalDraftStorageKey(userEmail?: string | null): string {
+  const email = userEmail?.trim().toLowerCase();
+  if (email) {
+    return `${CURRENT_AUDIT_KEY}_${email.replace(/[^a-z0-9]/g, '_')}`;
+  }
+  return CURRENT_AUDIT_KEY;
+}
+
+function writeLightLocalDraft(draft: any, userEmail?: string | null): void {
   try {
+    const currentEmail = (userEmail || getCurrentUser()?.email || draft?.ownerEmail || '').trim().toLowerCase();
+    const storageKey = getLocalDraftStorageKey(currentEmail);
     if (!draft) {
-      localStorage.removeItem(CURRENT_AUDIT_KEY);
+      localStorage.removeItem(storageKey);
       return;
     }
-    const currentEmail = getCurrentUser()?.email?.trim().toLowerCase() || draft.ownerEmail || '';
     const lightDraft = {
       ownerEmail: currentEmail,
       currentTab: draft.currentTab,
@@ -697,10 +708,12 @@ function writeLightLocalDraft(draft: any): void {
           isCustom: c.isCustom,
           score: c.score,
           notes: c.notes,
+          isUpdated: c.isUpdated,
+          lastSyncedAt: c.lastSyncedAt,
         })),
       })),
     };
-    localStorage.setItem(CURRENT_AUDIT_KEY, JSON.stringify(lightDraft));
+    localStorage.setItem(storageKey, JSON.stringify(lightDraft));
   } catch {}
 }
 
@@ -851,9 +864,9 @@ export async function saveActiveDraftImmediate(
     cloudSyncTimer = null;
   }
 
-  writeLightLocalDraft(stampedDraft);
+  writeLightLocalDraft(stampedDraft, currentEmail);
   if (stampedDraft) {
-    saveDraftToIndexedDB(stampedDraft).catch(() => {});
+    saveDraftToIndexedDB(stampedDraft, currentEmail).catch(() => {});
     const clientId = getClientDeviceId();
 
     if (await isBackendServerAvailable()) {
@@ -871,7 +884,7 @@ export async function saveActiveDraftImmediate(
 
     return await syncDraftToFirestore(stampedDraft, clientId, currentEmail);
   } else {
-    clearDraftFromIndexedDB().catch(() => {});
+    clearDraftFromIndexedDB(currentEmail).catch(() => {});
     return { ok: true, updatedAt };
   }
 }
@@ -886,15 +899,15 @@ export function saveActiveDraft(draft: any, isExplicitDelete = false): void {
       }
     : null;
 
-  // 1. High-capacity IndexedDB local backup (instant, supports 500-1000+ photos)
+  // 1. High-capacity IndexedDB local backup (isolated per user email)
   if (stampedDraft) {
-    saveDraftToIndexedDB(stampedDraft).catch(() => {});
+    saveDraftToIndexedDB(stampedDraft, currentEmail).catch(() => {});
   } else {
-    clearDraftFromIndexedDB().catch(() => {});
+    clearDraftFromIndexedDB(currentEmail).catch(() => {});
   }
 
-  // 2. Ultra-light LocalStorage backup (metadata only, <10KB, never blocks UI thread)
-  writeLightLocalDraft(stampedDraft);
+  // 2. Ultra-light LocalStorage backup (isolated per user email, <10KB)
+  writeLightLocalDraft(stampedDraft, currentEmail);
 
   // 3. Debounced Cloud Network Sync (Firestore + Server SSE) - fast 250ms sync across Mobile & PC
   if (cloudSyncTimer) clearTimeout(cloudSyncTimer);
@@ -940,6 +953,8 @@ export {
   clearFirestoreDraft,
   fetchDraftFromFirestore,
   fetchAllActiveDraftsForAdmin,
+  subscribeToAllActiveDraftsForAdmin,
+  subscribeToAuditsForUser,
   hydratePayloadPhotos,
   saveDraftToIndexedDB,
   clearDraftFromIndexedDB,
@@ -947,28 +962,38 @@ export {
   isAuditorAdmin,
 };
 
-export async function loadActiveDraftAsync(): Promise<any | null> {
+export async function loadActiveDraftAsync(userEmail?: string | null): Promise<any | null> {
+  const effectiveEmail = (userEmail || getCurrentUser()?.email || '').trim().toLowerCase();
+  if (!effectiveEmail) return null;
   try {
-    const dbDraft = await loadDraftFromIndexedDB();
+    const dbDraft = await loadDraftFromIndexedDB(effectiveEmail);
     if (dbDraft && (dbDraft.factoryInfo || dbDraft.sections)) {
-      return dbDraft;
+      if (!dbDraft.ownerEmail || dbDraft.ownerEmail.trim().toLowerCase() === effectiveEmail) {
+        return dbDraft;
+      }
     }
   } catch {
     // fallback
   }
-  return loadActiveDraft();
+  return loadActiveDraft(effectiveEmail);
 }
 
-export function loadActiveDraft(): any | null {
+export function loadActiveDraft(userEmail?: string | null): any | null {
   try {
-    const raw = localStorage.getItem(CURRENT_AUDIT_KEY);
+    const effectiveEmail = (userEmail || getCurrentUser()?.email || '').trim().toLowerCase();
+    if (!effectiveEmail) return null;
+    const storageKey = getLocalDraftStorageKey(effectiveEmail);
+    const raw = localStorage.getItem(storageKey);
     if (!raw) return null;
     const parsed = JSON.parse(raw);
+    if (parsed?.ownerEmail && parsed.ownerEmail.trim().toLowerCase() !== effectiveEmail) {
+      return null;
+    }
     if (
       parsed?.factoryInfo?.name === 'Northern Fashions Ltd.' ||
       parsed?.factoryInfo?.name === 'Apex Textile Mills Ltd.'
     ) {
-      localStorage.removeItem(CURRENT_AUDIT_KEY);
+      localStorage.removeItem(storageKey);
       return null;
     }
     return parsed;
@@ -977,10 +1002,12 @@ export function loadActiveDraft(): any | null {
   }
 }
 
-export async function fetchServerActiveDraft(): Promise<any | null> {
+export async function fetchServerActiveDraft(userEmail?: string | null): Promise<any | null> {
   if (!(await isBackendServerAvailable())) return null;
+  const effectiveEmail = (userEmail || getCurrentUser()?.email || '').trim().toLowerCase();
+  if (!effectiveEmail) return null;
   try {
-    const res = await fetch('/api/active-draft');
+    const res = await fetch(`/api/active-draft?email=${encodeURIComponent(effectiveEmail)}`);
     if (res.ok && res.headers.get('content-type')?.includes('application/json')) {
       const data = await res.json();
       if (data && (data.factoryInfo || data.sections)) {
@@ -995,16 +1022,18 @@ export async function fetchServerActiveDraft(): Promise<any | null> {
 
 /**
  * Subscribes to real-time Server-Sent Events stream (/api/active-draft/stream)
- * When hosted statically on Firebase Hosting (web.app), keeps live indicator connected via Firestore.
+ * scoped to the signed-in user's email.
  */
 export function subscribeToLiveDraftStream(
   onRemoteUpdate: (draft: any) => void,
-  onConnectionChange?: (connected: boolean) => void
+  onConnectionChange?: (connected: boolean) => void,
+  userEmail?: string | null
 ): () => void {
   if (typeof window === 'undefined' || !window.EventSource) {
     return () => {};
   }
 
+  const effectiveEmail = (userEmail || getCurrentUser()?.email || '').trim().toLowerCase();
   let eventSource: EventSource | null = null;
   let retryTimer: any = null;
   let isClosed = false;
@@ -1020,7 +1049,10 @@ export function subscribeToLiveDraftStream(
     }
 
     try {
-      eventSource = new EventSource('/api/active-draft/stream');
+      const streamUrl = effectiveEmail
+        ? `/api/active-draft/stream?email=${encodeURIComponent(effectiveEmail)}`
+        : '/api/active-draft/stream';
+      eventSource = new EventSource(streamUrl);
 
       eventSource.onopen = () => {
         onConnectionChange?.(true);
@@ -1030,6 +1062,9 @@ export function subscribeToLiveDraftStream(
         if (!e.data || e.data === 'null') return;
         try {
           const draft = JSON.parse(e.data);
+          if (draft?.ownerEmail && effectiveEmail && draft.ownerEmail.trim().toLowerCase() !== effectiveEmail) {
+            return;
+          }
           if (draft && (draft.factoryInfo || draft.sections)) {
             onRemoteUpdate(draft);
           }
@@ -1044,8 +1079,11 @@ export function subscribeToLiveDraftStream(
           const draft = JSON.parse(e.data);
           const currentDeviceId = getClientDeviceId();
 
-          // Only apply updates that came from another device/browser
+          // Only apply updates that came from another device/browser of this same email
           if (draft.senderClientId && draft.senderClientId === currentDeviceId) {
+            return;
+          }
+          if (draft?.ownerEmail && effectiveEmail && draft.ownerEmail.trim().toLowerCase() !== effectiveEmail) {
             return;
           }
 

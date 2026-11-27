@@ -35,6 +35,7 @@ interface Props {
   onApplyUpdate?: () => void;
   openCapCount?: number;
   totalCapCount?: number;
+  liveDraftCount?: number;
 }
 
 export const Header: React.FC<Props> = ({
@@ -58,6 +59,7 @@ export const Header: React.FC<Props> = ({
   onApplyUpdate,
   openCapCount = 0,
   totalCapCount = 0,
+  liveDraftCount = 0,
 }) => {
   const completionPercent = totalCheckpoints > 0 ? Math.round((evaluatedCount / totalCheckpoints) * 100) : 0;
 
@@ -290,6 +292,11 @@ export const Header: React.FC<Props> = ({
           >
             <History className="w-4 h-4 text-emerald-300" />
             <span>{isAdmin ? 'Saved Records (Admin)' : 'My Audits & CAP'}</span>
+            {isAdmin && liveDraftCount > 0 && (
+              <span className="px-1.5 py-0.2 rounded-full text-[10px] font-extrabold bg-emerald-400 text-slate-950 animate-pulse">
+                {liveDraftCount} Live
+              </span>
+            )}
           </button>
         </div>
       </div>
