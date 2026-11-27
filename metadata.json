@@ -1,0 +1,6 @@
+{
+  "name": "QualiTech QMS & Factory Technical Audit",
+  "description": "Comprehensive Technical and QMS Audit application optimized for Android mobile and Windows tablet/desktop with real-time scoring, customizable checkpoints, evidence capture, and automated PDF reporting.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

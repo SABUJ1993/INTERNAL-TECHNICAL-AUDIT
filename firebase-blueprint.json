@@ -1,0 +1,73 @@
+{
+  "entities": {
+    "auditReport": {
+      "title": "Audit Report",
+      "description": "Comprehensive Factory Technical and QMS Audit Report",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Unique report ID"
+        },
+        "factoryInfo": {
+          "type": "object",
+          "description": "Factory identification and pre-audit metadata"
+        },
+        "sections": {
+          "type": "array",
+          "description": "Audit sections and checkpoint scoring"
+        },
+        "overallPercentage": {
+          "type": "number",
+          "description": "Total percentage score earned"
+        },
+        "overallGrade": {
+          "type": "string",
+          "description": "Audit outcome grade (Deep Green, Amber, Red)"
+        },
+        "passedAudit": {
+          "type": "boolean",
+          "description": "Pass or conditional pass status"
+        },
+        "updatedAt": {
+          "type": "string",
+          "description": "ISO timestamp of last update"
+        }
+      },
+      "required": ["id", "factoryInfo", "overallPercentage"]
+    },
+    "auditDraft": {
+      "title": "Active Audit Draft",
+      "description": "Real-time working draft synced across mobile and desktop devices",
+      "type": "object",
+      "properties": {
+        "factoryInfo": {
+          "type": "object",
+          "description": "Pre-audit factory data and photos"
+        },
+        "sections": {
+          "type": "array",
+          "description": "Checkpoints and evidence photos"
+        },
+        "lastUpdated": {
+          "type": "string",
+          "description": "ISO timestamp of draft mutation"
+        },
+        "clientId": {
+          "type": "string",
+          "description": "Client device identifier"
+        }
+      }
+    }
+  },
+  "firestore": {
+    "/audits/{auditId}": {
+      "schema": "auditReport",
+      "description": "Saved completed or historical audit reports"
+    },
+    "/drafts/{draftId}": {
+      "schema": "auditDraft",
+      "description": "Active in-progress audit drafts synced in real time"
+    }
+  }
+}

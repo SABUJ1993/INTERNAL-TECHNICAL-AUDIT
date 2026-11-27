@@ -1,0 +1,854 @@
+import { AuditReportData, AuditorUser } from '../types/audit';
+import {
+  saveDraftToIndexedDB,
+  loadDraftFromIndexedDB,
+  clearDraftFromIndexedDB,
+  saveAuditToIndexedDB,
+  loadAuditsFromIndexedDB,
+  deleteAuditFromIndexedDB,
+} from './storageDb';
+import {
+  syncDraftToFirestore,
+  clearFirestoreDraft,
+  saveAuditToFirestore,
+  fetchAuditsFromFirestore,
+  deleteAuditFromFirestore,
+  subscribeToFirestoreDraft,
+  firestoreRegisterUser,
+  firestoreLoginUser,
+  firestoreRequestPasswordReset,
+  firestoreResetUserPassword,
+  ADMIN_EMAIL,
+  isAuditorAdmin,
+} from './firebase';
+
+const LOCAL_STORAGE_KEY = 'qualitech_audits_v1';
+const CURRENT_AUDIT_KEY = 'qualitech_active_audit_v1';
+const USER_KEY = 'qualitech_current_user';
+const SESSION_PERSISTENCE_KEY = 'active_auditor_session';
+const REGISTERED_USERS_KEY = 'qualitech_registered_auditors_v1';
+
+// Cache whether an Express backend server (/api/*) exists (false on static Firebase Hosting / web.app)
+let cachedBackendAvailable: boolean | null = null;
+let backendCheckPromise: Promise<boolean> | null = null;
+
+export function isStaticHostingDomain(): boolean {
+  if (typeof window === 'undefined') return false;
+  const host = window.location.hostname.toLowerCase();
+  return (
+    host.endsWith('.web.app') ||
+    host.endsWith('.firebaseapp.com') ||
+    host.endsWith('.netlify.app') ||
+    host.endsWith('.github.io') ||
+    window.location.protocol === 'file:'
+  );
+}
+
+export async function isBackendServerAvailable(): Promise<boolean> {
+  if (cachedBackendAvailable !== null) return cachedBackendAvailable;
+  if (isStaticHostingDomain()) {
+    cachedBackendAvailable = false;
+    return false;
+  }
+  if (!backendCheckPromise) {
+    backendCheckPromise = (async () => {
+      try {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), 1500);
+        const res = await fetch('/api/health', {
+          method: 'GET',
+          signal: controller.signal,
+          cache: 'no-store',
+        });
+        clearTimeout(timer);
+        const ct = res.headers.get('content-type') || '';
+        cachedBackendAvailable = res.ok && ct.includes('application/json');
+      } catch {
+        cachedBackendAvailable = false;
+      }
+      return cachedBackendAvailable;
+    })();
+  }
+  return backendCheckPromise;
+}
+
+export function getClientDeviceId(): string {
+  let id = sessionStorage.getItem('ita_client_device_id');
+  if (!id) {
+    id = `dev_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
+    sessionStorage.setItem('ita_client_device_id', id);
+  }
+  return id;
+}
+
+export interface RegisterAuditorParams {
+  name: string;
+  email: string;
+  password: string;
+  role?: string;
+  username?: string;
+  verificationCode?: string;
+}
+
+export async function sendGmailVerificationCode(email: string): Promise<{ success: boolean; message: string; code?: string }> {
+  const trimmed = email.trim().toLowerCase();
+  const isGmail = /^[a-zA-Z0-9._%+-]+@gmail\.com$/i.test(trimmed);
+  if (!isGmail) {
+    throw new Error('Please enter a valid Gmail address ending in @gmail.com');
+  }
+
+  if (await isBackendServerAvailable()) {
+    try {
+      const res = await fetch('/api/auth/send-code', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: trimmed }),
+      });
+
+      if (res.ok && res.headers.get('content-type')?.includes('application/json')) {
+        return await res.json();
+      } else {
+        const errData = await res.json().catch(() => ({}));
+        throw new Error(errData?.error || 'Failed to dispatch verification code');
+      }
+    } catch (err: any) {
+      if (err?.message && err.message.includes('Failed to dispatch')) {
+        // fallback below if network failed
+      }
+    }
+  }
+
+  // Direct / Firebase Hosting fallback code generation so app works seamlessly on web.app
+  const fallbackCode = Math.floor(100000 + Math.random() * 900000).toString();
+  try {
+    sessionStorage.setItem(`ita_otp_${trimmed}`, fallbackCode);
+  } catch {}
+  return {
+    success: true,
+    message: `Verification code generated for ${trimmed}`,
+    code: fallbackCode,
+  };
+}
+
+/**
+ * Request OTP code for Forgot Password
+ */
+export async function requestForgotPasswordOtp(email: string): Promise<{ success: boolean; message: string; code: string }> {
+  const trimmed = email.trim().toLowerCase();
+  const isGmail = /^[a-zA-Z0-9._%+-]+@gmail\.com$/i.test(trimmed);
+  if (!isGmail) {
+    throw new Error('Please enter a valid Gmail address ending in @gmail.com');
+  }
+
+  // 1. Try server request only when backend API exists
+  if (await isBackendServerAvailable()) {
+    try {
+      const res = await fetch('/api/auth/forgot-password/request', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: trimmed }),
+      });
+      if (res.ok && res.headers.get('content-type')?.includes('application/json')) {
+        const data = await res.json();
+        try {
+          await firestoreRequestPasswordReset(trimmed);
+        } catch {}
+        return data;
+      }
+    } catch (err) {
+      console.warn('Server forgot password request failed, trying Firestore', err);
+    }
+  }
+
+  // 2. Direct Firestore OTP generation (works on Firebase Hosting web.app)
+  const firestoreCode = await firestoreRequestPasswordReset(trimmed);
+  return {
+    success: true,
+    message: `Password reset OTP generated for ${trimmed}`,
+    code: firestoreCode,
+  };
+}
+
+/**
+ * Reset Auditor Password using verified OTP code
+ */
+export async function resetAuditorPassword(
+  email: string,
+  code: string,
+  newPassword: string
+): Promise<{ success: boolean; message: string }> {
+  const trimmedEmail = email.trim().toLowerCase();
+  const trimmedCode = code.trim();
+  const trimmedPass = newPassword.trim();
+
+  if (trimmedPass.length < 4) {
+    throw new Error('New password must be at least 4 characters long.');
+  }
+
+  let serverSuccess = false;
+  if (await isBackendServerAvailable()) {
+    try {
+      const res = await fetch('/api/auth/forgot-password/reset', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          email: trimmedEmail,
+          code: trimmedCode,
+          newPassword: trimmedPass,
+        }),
+      });
+      if (res.ok && res.headers.get('content-type')?.includes('application/json')) {
+        serverSuccess = true;
+      }
+    } catch (err) {
+      console.warn('Server password reset failed, using Firestore', err);
+    }
+  }
+
+  // Sync / update in Firestore for cross-device persistence
+  try {
+    await firestoreResetUserPassword(trimmedEmail, trimmedCode, trimmedPass);
+  } catch (err: any) {
+    if (!serverSuccess) {
+      throw err;
+    }
+  }
+
+  // Also update in local storage cache
+  try {
+    const users = getRegisteredUsers();
+    const idx = users.findIndex((u) => u.email?.toLowerCase() === trimmedEmail);
+    if (idx >= 0) {
+      users[idx].password = trimmedPass;
+      localStorage.setItem(REGISTERED_USERS_KEY, JSON.stringify(users));
+    }
+  } catch {}
+
+  return {
+    success: true,
+    message: 'Password reset successfully! You can now log in with your new password.',
+  };
+}
+
+export function getRegisteredUsers(): Array<AuditorUser & { password?: string }> {
+  try {
+    const raw = localStorage.getItem(REGISTERED_USERS_KEY);
+    return raw ? JSON.parse(raw) : [];
+  } catch {
+    return [];
+  }
+}
+
+export async function registerAuditor(params: RegisterAuditorParams): Promise<AuditorUser> {
+  const trimmedEmail = params.email.trim().toLowerCase();
+  const trimmedPass = params.password.trim();
+  const trimmedName = params.name.trim();
+
+  if (!trimmedEmail || !trimmedPass || !trimmedName) {
+    throw new Error('Full name, Gmail address, and password are required.');
+  }
+
+  const isGmail = /^[a-zA-Z0-9._%+-]+@gmail\.com$/i.test(trimmedEmail);
+  if (!isGmail) {
+    throw new Error('Registration requires a valid Gmail address (@gmail.com).');
+  }
+
+  // 1. Sync to Firestore (enables instant login on any other device)
+  try {
+    await firestoreRegisterUser({
+      name: trimmedName,
+      email: trimmedEmail,
+      password: trimmedPass,
+      role: params.role?.trim() || 'Lead QMS Auditor',
+    });
+  } catch (err: any) {
+    if (err?.message && err.message.includes('already registered')) {
+      throw err;
+    }
+    console.warn('Firestore user registration notice', err);
+  }
+
+  // 2. Try server registration only if backend API is active
+  if (await isBackendServerAvailable()) {
+    try {
+      const res = await fetch('/api/auth/register', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name: trimmedName,
+          email: trimmedEmail,
+          username: trimmedEmail,
+          password: trimmedPass,
+          role: params.role?.trim() || 'Lead QMS Auditor',
+          verificationCode: params.verificationCode,
+        }),
+      });
+
+      if (res.ok && res.headers.get('content-type')?.includes('application/json')) {
+        const newUser: AuditorUser = await res.json();
+        sessionStorage.setItem(USER_KEY, JSON.stringify(newUser));
+        localStorage.setItem(USER_KEY, JSON.stringify(newUser));
+        localStorage.setItem(SESSION_PERSISTENCE_KEY, JSON.stringify(newUser));
+        return newUser;
+      } else {
+        const errData = await res.json().catch(() => ({}));
+        if (errData?.error && !errData.error.includes('already registered')) {
+          throw new Error(errData.error);
+        }
+      }
+    } catch (err: any) {
+      if (err?.message && (err.message.includes('Verification') || err.message.includes('valid Gmail'))) {
+        throw err;
+      }
+      console.warn('Server registration offline, using local + Firestore copy', err);
+    }
+  }
+
+  // 3. Fallback to localStorage
+  const users = getRegisteredUsers();
+  const existing = users.find(
+    (u) => u.email?.toLowerCase() === trimmedEmail || u.username.toLowerCase() === trimmedEmail
+  );
+  if (!existing) {
+    const newUser: AuditorUser & { password?: string } = {
+      id: `aud-${Date.now()}`,
+      username: trimmedEmail,
+      name: trimmedName,
+      role: params.role?.trim() || 'Lead QMS Auditor',
+      email: trimmedEmail,
+      token: `token_${Date.now()}`,
+      password: trimmedPass,
+    };
+    users.push(newUser);
+    localStorage.setItem(REGISTERED_USERS_KEY, JSON.stringify(users));
+  }
+
+  const sessionUser: AuditorUser = {
+    id: `aud-${Date.now()}`,
+    username: trimmedEmail,
+    name: trimmedName,
+    role: params.role?.trim() || 'Lead QMS Auditor',
+    email: trimmedEmail,
+    token: `token_${Date.now()}`,
+  };
+
+  sessionStorage.setItem(USER_KEY, JSON.stringify(sessionUser));
+  localStorage.setItem(USER_KEY, JSON.stringify(sessionUser));
+  localStorage.setItem(SESSION_PERSISTENCE_KEY, JSON.stringify(sessionUser));
+  return sessionUser;
+}
+
+export async function loginAuditor(identifier: string, password: string): Promise<AuditorUser> {
+  const trimmed = identifier.trim().toLowerCase();
+  const trimmedPass = password.trim();
+
+  if (!trimmed || !trimmedPass) {
+    throw new Error('Please enter both Gmail address and password.');
+  }
+
+  // 1. FAST-PATH (< 5ms): Instant local verification if user registered on this device
+  const localUsers = getRegisteredUsers();
+  const localMatched = localUsers.find(
+    (u) =>
+      (u.email?.toLowerCase() === trimmed || u.username?.toLowerCase() === trimmed) &&
+      u.password === trimmedPass
+  );
+
+  if (localMatched) {
+    const sessionUser: AuditorUser = {
+      id: localMatched.id,
+      username: localMatched.username || trimmed,
+      name: localMatched.name || trimmed.split('@')[0],
+      role: localMatched.role || 'Lead QMS Auditor',
+      email: localMatched.email || trimmed,
+      token: localMatched.token || `token_${Date.now()}`,
+    };
+    sessionStorage.setItem(USER_KEY, JSON.stringify(sessionUser));
+    localStorage.setItem(USER_KEY, JSON.stringify(sessionUser));
+    localStorage.setItem(SESSION_PERSISTENCE_KEY, JSON.stringify(sessionUser));
+    return sessionUser;
+  }
+
+  // Built-in Admin fallback: If quality.bd.eng@gmail.com logs in with 1234
+  if (trimmed === 'quality.bd.eng@gmail.com' && (trimmedPass === '1234' || trimmedPass === 'admin' || trimmedPass === 'Admin')) {
+    const adminUser: AuditorUser = {
+      id: 'aud-admin-master',
+      username: 'quality.bd.eng@gmail.com',
+      name: 'Sabuj Mahmud',
+      role: 'Lead QMS Auditor',
+      email: 'quality.bd.eng@gmail.com',
+      token: `token_admin_${Date.now()}`,
+    };
+    // Cache for subsequent instant logins
+    const allUsers = getRegisteredUsers();
+    const idx = allUsers.findIndex(u => u.email?.toLowerCase() === trimmed);
+    if (idx >= 0) allUsers[idx] = { ...adminUser, password: trimmedPass };
+    else allUsers.push({ ...adminUser, password: trimmedPass });
+    localStorage.setItem(REGISTERED_USERS_KEY, JSON.stringify(allUsers));
+    sessionStorage.setItem(USER_KEY, JSON.stringify(adminUser));
+    localStorage.setItem(USER_KEY, JSON.stringify(adminUser));
+    localStorage.setItem(SESSION_PERSISTENCE_KEY, JSON.stringify(adminUser));
+    return adminUser;
+  }
+
+  // 2. PARALLEL REMOTE CHECK: Fast race between server (if available) and Firestore (max 2.5s)
+  const serverLoginPromise = (async (): Promise<AuditorUser | null> => {
+    if (!(await isBackendServerAvailable())) return null;
+    try {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 2500);
+      const res = await fetch('/api/auth/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username: trimmed, password: trimmedPass }),
+        signal: controller.signal,
+      });
+      clearTimeout(timer);
+      if (res.ok && res.headers.get('content-type')?.includes('application/json')) {
+        const data = await res.json();
+        return {
+          id: data.user.id || `aud-${Date.now()}`,
+          username: data.user.username || trimmed,
+          name: data.user.name || trimmed,
+          role: data.user.role || 'Lead QMS Auditor',
+          email: data.user.email || trimmed,
+          token: data.token,
+        };
+      }
+    } catch {
+      // ignore
+    }
+    return null;
+  })();
+
+  const firestoreLoginPromise = (async (): Promise<AuditorUser | null> => {
+    try {
+      return await firestoreLoginUser(trimmed, trimmedPass);
+    } catch {
+      return null;
+    }
+  })();
+
+  const [serverUser, firestoreUser] = await Promise.all([serverLoginPromise, firestoreLoginPromise]);
+  const verifiedUser = serverUser || firestoreUser;
+
+  if (verifiedUser) {
+    // Cache credentials in local store so future logins are instant and never fail
+    const allUsers = getRegisteredUsers();
+    const idx = allUsers.findIndex((u) => u.email?.toLowerCase() === trimmed);
+    const updatedRecord = { ...verifiedUser, password: trimmedPass };
+    if (idx >= 0) {
+      allUsers[idx] = updatedRecord;
+    } else {
+      allUsers.push(updatedRecord);
+    }
+    localStorage.setItem(REGISTERED_USERS_KEY, JSON.stringify(allUsers));
+    sessionStorage.setItem(USER_KEY, JSON.stringify(verifiedUser));
+    localStorage.setItem(USER_KEY, JSON.stringify(verifiedUser));
+    localStorage.setItem(SESSION_PERSISTENCE_KEY, JSON.stringify(verifiedUser));
+    return verifiedUser;
+  }
+
+  throw new Error('Invalid Gmail address or password. Please verify your credentials or register an account first.');
+}
+
+export function getCurrentUser(): AuditorUser | null {
+  try {
+    const raw =
+      localStorage.getItem(SESSION_PERSISTENCE_KEY) ||
+      sessionStorage.getItem(USER_KEY) ||
+      localStorage.getItem(USER_KEY);
+    return raw ? JSON.parse(raw) : null;
+  } catch {
+    return null;
+  }
+}
+
+export function logoutAuditor(): void {
+  try {
+    sessionStorage.removeItem(USER_KEY);
+    localStorage.removeItem(USER_KEY);
+    localStorage.removeItem(SESSION_PERSISTENCE_KEY);
+  } catch {
+    // ignore
+  }
+}
+
+// Local cache + server sync for audits - STRICTLY RESTRICTED TO ADMIN (quality.bd.eng@gmail.com)
+export async function fetchAllAudits(requesterEmail?: string): Promise<AuditReportData[]> {
+  const adminEmail = requesterEmail || getCurrentUser()?.email;
+  // Security guard: Only Admin can view saved audit archives
+  if (!isAuditorAdmin(adminEmail)) {
+    return [];
+  }
+
+  let serverAudits: AuditReportData[] = [];
+  if (await isBackendServerAvailable()) {
+    try {
+      const res = await fetch('/api/audits', {
+        headers: {
+          'x-auditor-email': adminEmail || '',
+        },
+      });
+      if (res.ok && res.headers.get('content-type')?.includes('application/json')) {
+        serverAudits = await res.json();
+      }
+    } catch (e) {
+      console.warn('Could not fetch audits from server, loading local/Firestore cache', e);
+    }
+  }
+
+  // Load from Firestore (cloud database)
+  let firestoreAudits: AuditReportData[] = [];
+  try {
+    firestoreAudits = await fetchAuditsFromFirestore(adminEmail);
+  } catch (err) {
+    console.warn('Error reading audits from Firestore', err);
+  }
+
+  // Load from IndexedDB (handles 500+ photos without localStorage quota limit)
+  let idbAudits: AuditReportData[] = [];
+  try {
+    idbAudits = await loadAuditsFromIndexedDB();
+  } catch (err) {
+    console.warn('Error reading audits from IndexedDB', err);
+  }
+
+  // Merge with localStorage
+  let localAudits: AuditReportData[] = [];
+  try {
+    const raw = localStorage.getItem(LOCAL_STORAGE_KEY);
+    if (raw) {
+      const list: AuditReportData[] = JSON.parse(raw);
+      localAudits = list.filter(
+        (a) =>
+          a.factoryInfo?.name !== 'Northern Fashions Ltd.' &&
+          a.factoryInfo?.name !== 'Apex Textile Mills Ltd.'
+      );
+    }
+  } catch (e) {
+    console.warn('Error reading local audits', e);
+  }
+
+  const map = new Map<string, AuditReportData>();
+  localAudits.forEach((a) => map.set(a.id, a));
+  idbAudits.forEach((a) => map.set(a.id, a));
+  firestoreAudits.forEach((a) => map.set(a.id, a));
+  serverAudits.forEach((a) => map.set(a.id, a));
+
+  const merged = Array.from(map.values()).sort(
+    (a, b) => new Date(b.updatedAt || b.createdAt).getTime() - new Date(a.updatedAt || a.createdAt).getTime()
+  );
+
+  return merged;
+}
+
+export async function saveAuditReport(report: AuditReportData): Promise<AuditReportData> {
+  // 1. Save to high-capacity IndexedDB (handles 500+ photos)
+  try {
+    await saveAuditToIndexedDB(report);
+  } catch (err) {
+    console.warn('IndexedDB save audit failed', err);
+  }
+
+  // 2. Save to Firestore cloud database
+  try {
+    await saveAuditToFirestore(report);
+  } catch (err) {
+    console.warn('Firestore save audit failed', err);
+  }
+
+  // 3. Save to local storage for resilience (if quota allows)
+  try {
+    const raw = localStorage.getItem(LOCAL_STORAGE_KEY);
+    const list: AuditReportData[] = raw ? JSON.parse(raw) : [];
+    const idx = list.findIndex((a) => a.id === report.id);
+    if (idx >= 0) {
+      list[idx] = report;
+    } else {
+      list.unshift(report);
+    }
+    localStorage.setItem(LOCAL_STORAGE_KEY, JSON.stringify(list));
+  } catch {
+    // Quota exceeded is safely caught; IndexedDB & Firestore already have the full report
+  }
+
+  // 4. Also save to server if backend API is active
+  if (await isBackendServerAvailable()) {
+    try {
+      const res = await fetch('/api/audits', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(report),
+      });
+      if (res.ok && res.headers.get('content-type')?.includes('application/json')) {
+        return await res.json();
+      }
+    } catch (e) {
+      console.warn('Server save failed, using Firestore/local copy', e);
+    }
+  }
+
+  return report;
+}
+
+export async function deleteAuditReport(id: string, requesterEmail?: string): Promise<void> {
+  const adminEmail = requesterEmail || getCurrentUser()?.email;
+  if (!isAuditorAdmin(adminEmail)) {
+    throw new Error('Permission denied: Only Admin (quality.bd.eng@gmail.com) can delete saved audit archives.');
+  }
+
+  try {
+    await deleteAuditFromIndexedDB(id);
+  } catch (err) {
+    console.warn('IndexedDB delete failed', err);
+  }
+
+  try {
+    await deleteAuditFromFirestore(id, adminEmail);
+  } catch (err) {
+    console.warn('Firestore delete failed', err);
+  }
+
+  if (await isBackendServerAvailable()) {
+    try {
+      await fetch(`/api/audits/${id}`, {
+        method: 'DELETE',
+        headers: {
+          'x-auditor-email': adminEmail || '',
+        },
+      });
+    } catch (e) {
+      console.warn('Server delete failed', e);
+    }
+  }
+
+  try {
+    const raw = localStorage.getItem(LOCAL_STORAGE_KEY);
+    if (raw) {
+      const list: AuditReportData[] = JSON.parse(raw);
+      const filtered = list.filter((a) => a.id !== id);
+      localStorage.setItem(LOCAL_STORAGE_KEY, JSON.stringify(filtered));
+    }
+  } catch (e) {
+    console.warn('Local delete failed', e);
+  }
+}
+
+// ==========================================
+// REAL-TIME CLOUD DRAFT SYNCHRONIZATION
+// ==========================================
+
+let cloudSyncTimer: any = null;
+
+export function saveActiveDraft(draft: any, isExplicitDelete = false): void {
+  // 1. High-capacity IndexedDB local backup (instant, supports 500-1000+ photos)
+  if (draft) {
+    saveDraftToIndexedDB(draft).catch(() => {});
+  } else {
+    clearDraftFromIndexedDB().catch(() => {});
+  }
+
+  // 2. Ultra-light LocalStorage backup (metadata only, <10KB, never blocks UI thread)
+  try {
+    if (!draft) {
+      localStorage.removeItem(CURRENT_AUDIT_KEY);
+    } else {
+      const lightDraft = {
+        factoryInfo: {
+          ...draft.factoryInfo,
+          openingMeetingPhoto: draft.factoryInfo?.openingMeetingPhoto ? 'attached' : undefined,
+          factoryOutlookPhotos: [],
+        },
+        sections: draft.sections?.map((s: any) => ({
+          ...s,
+          checkpoints: s.checkpoints?.map((c: any) => ({
+            id: c.id,
+            score: c.score,
+            notes: c.notes,
+          })),
+        })),
+      };
+      localStorage.setItem(CURRENT_AUDIT_KEY, JSON.stringify(lightDraft));
+    }
+  } catch {}
+
+  // 3. Debounced Cloud Network Sync (Firestore + Server SSE) - avoids freezing UI during rapid inputs
+  if (cloudSyncTimer) clearTimeout(cloudSyncTimer);
+
+  const delay = isExplicitDelete ? 50 : 800;
+  cloudSyncTimer = setTimeout(async () => {
+    // A. Direct Firestore Real-Time Sync across Mobile APK & Browser
+    try {
+      const clientId = getClientDeviceId();
+      syncDraftToFirestore(draft, clientId).catch(() => {});
+    } catch (err) {
+      console.warn('Failed triggering Firestore draft sync', err);
+    }
+
+    // B. Background server sync (only when Express backend is running)
+    if (await isBackendServerAvailable()) {
+      try {
+        const clientId = getClientDeviceId();
+        const payload = {
+          ...draft,
+          clientId,
+          isExplicitDelete,
+          lastUpdatedBy: draft?.factoryInfo?.auditorName || 'Auditor',
+        };
+
+        fetch('/api/active-draft', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        }).catch((err) => {
+          console.warn('Background draft cloud sync failed', err);
+        });
+      } catch (e) {
+        console.warn('Failed triggering cloud draft sync', e);
+      }
+    }
+  }, delay);
+}
+
+export { subscribeToFirestoreDraft, clearFirestoreDraft };
+
+export async function loadActiveDraftAsync(): Promise<any | null> {
+  try {
+    const dbDraft = await loadDraftFromIndexedDB();
+    if (dbDraft && (dbDraft.factoryInfo || dbDraft.sections)) {
+      return dbDraft;
+    }
+  } catch {
+    // fallback
+  }
+  return loadActiveDraft();
+}
+
+export function loadActiveDraft(): any | null {
+  try {
+    const raw = localStorage.getItem(CURRENT_AUDIT_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (
+      parsed?.factoryInfo?.name === 'Northern Fashions Ltd.' ||
+      parsed?.factoryInfo?.name === 'Apex Textile Mills Ltd.'
+    ) {
+      localStorage.removeItem(CURRENT_AUDIT_KEY);
+      return null;
+    }
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+export async function fetchServerActiveDraft(): Promise<any | null> {
+  if (!(await isBackendServerAvailable())) return null;
+  try {
+    const res = await fetch('/api/active-draft');
+    if (res.ok && res.headers.get('content-type')?.includes('application/json')) {
+      const data = await res.json();
+      if (data && (data.factoryInfo || data.sections)) {
+        return data;
+      }
+    }
+  } catch (e) {
+    console.warn('Could not fetch cloud draft', e);
+  }
+  return null;
+}
+
+/**
+ * Subscribes to real-time Server-Sent Events stream (/api/active-draft/stream)
+ * When hosted statically on Firebase Hosting (web.app), keeps live indicator connected via Firestore.
+ */
+export function subscribeToLiveDraftStream(
+  onRemoteUpdate: (draft: any) => void,
+  onConnectionChange?: (connected: boolean) => void
+): () => void {
+  if (typeof window === 'undefined' || !window.EventSource) {
+    return () => {};
+  }
+
+  let eventSource: EventSource | null = null;
+  let retryTimer: any = null;
+  let isClosed = false;
+
+  async function connect() {
+    if (isClosed) return;
+
+    const hasServer = await isBackendServerAvailable();
+    if (!hasServer) {
+      // Running on Firebase Hosting (web.app) — Firestore handles real-time sync directly
+      onConnectionChange?.(true);
+      return;
+    }
+
+    try {
+      eventSource = new EventSource('/api/active-draft/stream');
+
+      eventSource.onopen = () => {
+        onConnectionChange?.(true);
+      };
+
+      eventSource.addEventListener('initial_state', (e: MessageEvent) => {
+        if (!e.data || e.data === 'null') return;
+        try {
+          const draft = JSON.parse(e.data);
+          if (draft && (draft.factoryInfo || draft.sections)) {
+            onRemoteUpdate(draft);
+          }
+        } catch (err) {
+          console.warn('Error parsing initial draft stream', err);
+        }
+      });
+
+      eventSource.addEventListener('draft_update', (e: MessageEvent) => {
+        if (!e.data) return;
+        try {
+          const draft = JSON.parse(e.data);
+          const currentDeviceId = getClientDeviceId();
+
+          // Only apply updates that came from another device/browser
+          if (draft.senderClientId && draft.senderClientId === currentDeviceId) {
+            return;
+          }
+
+          if (draft && (draft.factoryInfo || draft.sections)) {
+            onRemoteUpdate(draft);
+          }
+        } catch (err) {
+          console.warn('Error parsing live draft update', err);
+        }
+      });
+
+      eventSource.onerror = () => {
+        onConnectionChange?.(false);
+        if (eventSource) {
+          eventSource.close();
+          eventSource = null;
+        }
+        if (!isClosed) {
+          retryTimer = setTimeout(connect, 3000);
+        }
+      };
+    } catch (err) {
+      console.warn('Could not open SSE connection', err);
+      if (!isClosed) {
+        retryTimer = setTimeout(connect, 5000);
+      }
+    }
+  }
+
+  connect();
+
+  return () => {
+    isClosed = true;
+    if (retryTimer) clearTimeout(retryTimer);
+    if (eventSource) {
+      eventSource.close();
+      eventSource = null;
+    }
+  };
+}
