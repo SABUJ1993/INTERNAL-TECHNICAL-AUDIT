@@ -10,6 +10,9 @@ import {
 import {
   syncDraftToFirestore,
   clearFirestoreDraft,
+  fetchDraftFromFirestore,
+  fetchAllActiveDraftsForAdmin,
+  hydratePayloadPhotos,
   saveAuditToFirestore,
   fetchAuditsFromFirestore,
   deleteAuditFromFirestore,
@@ -709,11 +712,14 @@ export function isValidPhotoUrl(url?: string | null): boolean {
 /**
  * Merges a remote or light draft into current local state WITHOUT ever wiping out
  * real image dataUrls with 'image-attached' or 'attached' placeholders.
+ * When `isAuthoritativeRemote` is true (Firestore / SSE), photo additions AND deletions
+ * from the other device are honored accurately.
  */
 export function mergeDraftPreservingPhotos(
   currentFactory: any,
   currentSections: any[],
-  incomingDraft: any
+  incomingDraft: any,
+  isAuthoritativeRemote = true
 ): { factoryInfo: any; sections: any[] } {
   if (!incomingDraft) {
     return { factoryInfo: currentFactory, sections: currentSections };
@@ -725,16 +731,22 @@ export function mergeDraftPreservingPhotos(
     const prevOpening = isValidPhotoUrl(currentFactory?.openingMeetingPhoto)
       ? currentFactory.openingMeetingPhoto
       : undefined;
-    const incOpening = isValidPhotoUrl(incF.openingMeetingPhoto)
-      ? incF.openingMeetingPhoto
-      : undefined;
+    const rawOpening = incF.openingMeetingPhoto;
+    const isOpeningPlaceholder = rawOpening === 'attached' || rawOpening === 'image-attached';
+    let finalOpening = prevOpening;
+    if (isValidPhotoUrl(rawOpening)) {
+      finalOpening = rawOpening;
+    } else if (isOpeningPlaceholder) {
+      finalOpening = prevOpening;
+    } else if (isAuthoritativeRemote && 'openingMeetingPhoto' in incF && !rawOpening) {
+      finalOpening = undefined;
+    }
 
     const prevOutlook: any[] = Array.isArray(currentFactory?.factoryOutlookPhotos)
       ? currentFactory.factoryOutlookPhotos
       : [];
-    const incOutlook: any[] = Array.isArray(incF.factoryOutlookPhotos)
-      ? incF.factoryOutlookPhotos
-      : [];
+    const hasIncOutlookArray = Array.isArray(incF.factoryOutlookPhotos);
+    const incOutlook: any[] = hasIncOutlookArray ? incF.factoryOutlookPhotos : [];
 
     let finalOutlook = prevOutlook;
     if (incOutlook.length > 0) {
@@ -747,6 +759,9 @@ export function mergeDraftPreservingPhotos(
             : null;
         })
         .filter(Boolean);
+    } else if (isAuthoritativeRemote && hasIncOutlookArray) {
+      // Authoritative remote explicitly cleared/deleted all outlook photos
+      finalOutlook = [];
     }
 
     const prevCerts: any[] = Array.isArray(currentFactory?.certifications)
@@ -757,15 +772,19 @@ export function mergeDraftPreservingPhotos(
       incCerts.length > 0
         ? incCerts.map((c: any) => {
             if (isValidPhotoUrl(c.photo)) return c;
+            const isCertPlaceholder = c.photo === 'attached' || c.photo === 'image-attached';
             const prevC = prevCerts.find((pc) => pc.id === c.id);
-            return prevC && isValidPhotoUrl(prevC.photo) ? { ...c, photo: prevC.photo } : { ...c, photo: undefined };
+            if ((isCertPlaceholder || !isAuthoritativeRemote) && prevC && isValidPhotoUrl(prevC.photo)) {
+              return { ...c, photo: prevC.photo };
+            }
+            return { ...c, photo: undefined };
           })
         : prevCerts;
 
     mergedFactory = {
       ...currentFactory,
       ...incF,
-      openingMeetingPhoto: incOpening || prevOpening,
+      openingMeetingPhoto: finalOpening,
       factoryOutlookPhotos: finalOutlook,
       certifications: finalCerts,
     };
@@ -778,7 +797,8 @@ export function mergeDraftPreservingPhotos(
       const mergedCheckpoints = (incSec.checkpoints || []).map((incCp: any) => {
         const prevCp = prevSec?.checkpoints?.find((c: any) => c.id === incCp.id);
         const prevImgs: any[] = Array.isArray(prevCp?.images) ? prevCp.images : [];
-        const incImgs: any[] = Array.isArray(incCp?.images) ? incCp.images : [];
+        const hasIncImgsArray = Array.isArray(incCp?.images);
+        const incImgs: any[] = hasIncImgsArray ? incCp.images : [];
 
         let finalImages = prevImgs;
         if (incImgs.length > 0) {
@@ -791,6 +811,9 @@ export function mergeDraftPreservingPhotos(
                 : null;
             })
             .filter(Boolean);
+        } else if (isAuthoritativeRemote && hasIncImgsArray) {
+          // Authoritative remote explicitly has 0 images for this checkpoint
+          finalImages = [];
         }
 
         return {
@@ -888,7 +911,17 @@ export function saveActiveDraft(draft: any, isExplicitDelete = false): void {
   }, delay);
 }
 
-export { subscribeToFirestoreDraft, clearFirestoreDraft };
+export {
+  subscribeToFirestoreDraft,
+  clearFirestoreDraft,
+  fetchDraftFromFirestore,
+  fetchAllActiveDraftsForAdmin,
+  hydratePayloadPhotos,
+  saveDraftToIndexedDB,
+  clearDraftFromIndexedDB,
+  ADMIN_EMAIL,
+  isAuditorAdmin,
+};
 
 export async function loadActiveDraftAsync(): Promise<any | null> {
   try {

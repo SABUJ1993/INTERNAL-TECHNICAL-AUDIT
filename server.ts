@@ -412,7 +412,7 @@ app.get('/api/active-draft', (req, res) => {
 });
 
 app.post('/api/active-draft', (req, res) => {
-  const { factoryInfo, sections, clientId, lastUpdatedBy } = req.body;
+  const { factoryInfo, sections, clientId, lastUpdatedBy, ownerEmail } = req.body;
   if (!factoryInfo && !sections) {
     return res.status(400).json({ error: 'Invalid draft data' });
   }
@@ -423,6 +423,7 @@ app.post('/api/active-draft', (req, res) => {
   const mergedSections = sections ? [...sections] : existingDraft?.sections || null;
 
   const updatedDraft = {
+    ownerEmail: ownerEmail || existingDraft?.ownerEmail || null,
     factoryInfo: mergedFactoryInfo,
     sections: mergedSections,
     clientId: clientId || null,

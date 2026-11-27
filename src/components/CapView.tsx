@@ -14,6 +14,7 @@ import {
   Images,
   Check,
   ShieldCheck,
+  Trash2,
 } from 'lucide-react';
 import {
   AuditReportData,
@@ -22,16 +23,18 @@ import {
   CapStatus,
   CheckpointEvidence,
   SCORE_DEFINITIONS,
+  ScoreOption,
 } from '../types/audit';
 import { buildCapItemsFromReport } from '../utils/capHelpers';
 import { generateCapPdf } from '../utils/pdfGenerator';
 import { optimizeAuditImageWithMeta } from '../utils/imageCompressor';
 import { EvidencePhotoThumbnail } from './EvidencePhotoThumbnail';
+import { isAuditorAdmin } from '../services/firebase';
 
 interface Props {
   report: AuditReportData;
   currentUser?: AuditorUser | null;
-  onUpdateCapItems: (capItems: CapItem[]) => Promise<void> | void;
+  onUpdateCapItems: (capItems: CapItem[], dismissedCapIds?: string[]) => Promise<void> | void;
   onBackToReport: () => void;
   onOpenPreviewImage: (evidence: CheckpointEvidence) => void;
 }
@@ -43,15 +46,22 @@ export const CapView: React.FC<Props> = ({
   onBackToReport,
   onOpenPreviewImage,
 }) => {
+  const isAdmin = isAuditorAdmin(currentUser?.email);
   const capItems = useMemo(() => buildCapItemsFromReport(report), [report]);
   const [filterStatus, setFilterStatus] = useState<'all' | CapStatus>('all');
   const [saving, setSaving] = useState(false);
   const [saveDone, setSaveDone] = useState(false);
   const [downloadingPdf, setDownloadingPdf] = useState(false);
   const [showCustomModal, setShowCustomModal] = useState(false);
+  const [confirmRemoveId, setConfirmRemoveId] = useState<string | null>(null);
   const [customTitle, setCustomTitle] = useState('');
   const [customNotes, setCustomNotes] = useState('');
   const [customSection, setCustomSection] = useState('General Quality & Compliance');
+  const [customSeverity, setCustomSeverity] = useState<Exclude<ScoreOption, null | 'none' | 'na'>>('major');
+  const [customOwner, setCustomOwner] = useState(report.factoryInfo.contactPerson || '');
+  const [customTargetDate, setCustomTargetDate] = useState(
+    new Date(Date.now() + 14 * 86400000).toISOString().split('T')[0]
+  );
   const fileInputRefs = useRef<Record<string, HTMLInputElement | null>>({});
 
   const openCount = capItems.filter((c) => c.status === 'open').length;
@@ -63,8 +73,8 @@ export const CapView: React.FC<Props> = ({
     filterStatus === 'all' ? true : item.status === filterStatus
   );
 
-  const commitCapChange = async (updatedList: CapItem[]) => {
-    await onUpdateCapItems(updatedList);
+  const commitCapChange = async (updatedList: CapItem[], nextDismissed?: string[]) => {
+    await onUpdateCapItems(updatedList, nextDismissed ?? report.dismissedCapIds);
   };
 
   const handleFieldUpdate = (capId: string, field: keyof CapItem, value: any) => {
@@ -150,28 +160,60 @@ export const CapView: React.FC<Props> = ({
 
   const handleAddCustomCap = () => {
     if (!customTitle.trim()) return;
+    const nowIso = new Date().toISOString();
     const newItem: CapItem = {
       id: `cap-custom-${Date.now()}`,
       checkpointId: `cap-custom-${Date.now()}`,
       sectionId: 'custom',
-      sectionName: customSection.trim() || 'General Quality',
+      sectionName: customSection.trim() || 'General Quality & Compliance',
       checkpointCode: `CAP-${capItems.length + 1}`,
       checkpointTitle: customTitle.trim(),
-      originalScore: 'major',
-      originalNotes: customNotes.trim() || 'Additional CAP item opened during follow-up.',
+      originalScore: customSeverity,
+      originalNotes: customNotes.trim() || 'CAP issued for corrective action and closure verification.',
       originalImages: [],
       rootCause: '',
       correctiveAction: '',
-      responsiblePerson: report.factoryInfo.contactPerson || '',
-      targetDate: new Date(Date.now() + 14 * 86400000).toISOString().split('T')[0],
+      responsiblePerson: customOwner.trim() || report.factoryInfo.contactPerson || '',
+      targetDate: customTargetDate || new Date(Date.now() + 14 * 86400000).toISOString().split('T')[0],
       status: 'open',
       closureNotes: '',
       closureImages: [],
+      issuedBy: isAdmin ? `Admin (${currentUser?.name || currentUser?.email})` : currentUser?.name || undefined,
+      issuedAt: nowIso,
     };
     commitCapChange([...capItems, newItem]);
     setCustomTitle('');
     setCustomNotes('');
     setShowCustomModal(false);
+  };
+
+  const handleRemoveCapItem = async (item: CapItem) => {
+    if (!isAdmin) return;
+    const updatedList = capItems.filter((c) => c.id !== item.id);
+    const existingDismissed = new Set<string>(report.dismissedCapIds || []);
+    if (!item.id.startsWith('cap-custom-')) {
+      existingDismissed.add(item.checkpointId || item.id);
+      existingDismissed.add(item.id);
+    }
+    setConfirmRemoveId(null);
+    await commitCapChange(updatedList, Array.from(existingDismissed));
+  };
+
+  const handleCloseAllCapItems = async () => {
+    if (!isAdmin) return;
+    const nowIso = new Date().toISOString();
+    const verifier = currentUser?.name || 'Admin';
+    const updated = capItems.map((item) =>
+      item.status === 'closed'
+        ? item
+        : {
+            ...item,
+            status: 'closed' as CapStatus,
+            closedAt: nowIso,
+            verifiedBy: verifier,
+          }
+    );
+    await commitCapChange(updated);
   };
 
   return (
@@ -214,8 +256,20 @@ export const CapView: React.FC<Props> = ({
             className="px-3.5 py-2 rounded-xl bg-indigo-50 hover:bg-indigo-100 text-indigo-700 border border-indigo-200 text-xs font-bold flex items-center gap-1.5 cursor-pointer"
           >
             <Plus className="w-3.5 h-3.5" />
-            <span>Open Custom CAP</span>
+            <span>{isAdmin ? 'Issue New CAP' : 'Open Custom CAP'}</span>
           </button>
+
+          {isAdmin && openCount + inProgressCount > 0 && (
+            <button
+              type="button"
+              onClick={handleCloseAllCapItems}
+              className="px-3.5 py-2 rounded-xl bg-emerald-50 hover:bg-emerald-100 text-emerald-800 border border-emerald-200 text-xs font-bold flex items-center gap-1.5 cursor-pointer"
+              title="Verify & close all remaining CAP items as Admin"
+            >
+              <CheckCircle2 className="w-3.5 h-3.5" />
+              <span>Close All CAPs</span>
+            </button>
+          )}
 
           <button
             type="button"
@@ -304,20 +358,41 @@ export const CapView: React.FC<Props> = ({
         </div>
       </div>
 
-      {/* Custom CAP Modal */}
+      {/* Custom / Admin Issue CAP Modal */}
       {showCustomModal && (
         <div className="fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-xs flex items-center justify-center p-4">
-          <div className="bg-white rounded-2xl max-w-md w-full p-5 shadow-2xl border border-slate-200 space-y-4">
-            <h3 className="text-base font-black text-slate-900">Open New Custom CAP Item</h3>
+          <div className="bg-white rounded-2xl max-w-lg w-full p-5 shadow-2xl border border-slate-200 space-y-4">
+            <h3 className="text-base font-black text-slate-900">
+              {isAdmin ? 'Issue New CAP Item (Admin)' : 'Open New Custom CAP Item'}
+            </h3>
             <div className="space-y-3">
-              <div>
-                <label className="block text-xs font-bold text-slate-700 mb-1">Section / Department</label>
-                <input
-                  type="text"
-                  value={customSection}
-                  onChange={(e) => setCustomSection(e.target.value)}
-                  className="w-full px-3 py-2 text-xs border border-slate-300 rounded-xl focus:ring-2 focus:ring-blue-600 focus:outline-none"
-                />
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div>
+                  <label className="block text-xs font-bold text-slate-700 mb-1">Section / Department</label>
+                  <input
+                    type="text"
+                    value={customSection}
+                    onChange={(e) => setCustomSection(e.target.value)}
+                    className="w-full px-3 py-2 text-xs border border-slate-300 rounded-xl focus:ring-2 focus:ring-blue-600 focus:outline-none"
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs font-bold text-slate-700 mb-1">Severity Level</label>
+                  <select
+                    value={customSeverity}
+                    onChange={(e) => {
+                      const val = e.target.value as Exclude<ScoreOption, null | 'none' | 'na'>;
+                      setCustomSeverity(val);
+                      const days = val === 'critical' ? 2 : val === 'major' ? 14 : 30;
+                      setCustomTargetDate(new Date(Date.now() + days * 86400000).toISOString().split('T')[0]);
+                    }}
+                    className="w-full px-3 py-2 text-xs border border-slate-300 rounded-xl bg-white focus:ring-2 focus:ring-blue-600 focus:outline-none font-semibold"
+                  >
+                    <option value="critical">Not Accepted (Critical - 0 pts)</option>
+                    <option value="major">Below Expectation (Major - 3 pts)</option>
+                    <option value="minor">Acceptable (Minor - 7 pts)</option>
+                  </select>
+                </div>
               </div>
               <div>
                 <label className="block text-xs font-bold text-slate-700 mb-1">Issue / Finding Title *</label>
@@ -329,13 +404,34 @@ export const CapView: React.FC<Props> = ({
                   className="w-full px-3 py-2 text-xs border border-slate-300 rounded-xl focus:ring-2 focus:ring-blue-600 focus:outline-none"
                 />
               </div>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div>
+                  <label className="block text-xs font-bold text-slate-700 mb-1">Responsible Person</label>
+                  <input
+                    type="text"
+                    value={customOwner}
+                    onChange={(e) => setCustomOwner(e.target.value)}
+                    placeholder="e.g. QA Manager"
+                    className="w-full px-3 py-2 text-xs border border-slate-300 rounded-xl focus:ring-2 focus:ring-blue-600 focus:outline-none"
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs font-bold text-slate-700 mb-1">Target Completion Date</label>
+                  <input
+                    type="date"
+                    value={customTargetDate}
+                    onChange={(e) => setCustomTargetDate(e.target.value)}
+                    className="w-full px-3 py-2 text-xs border border-slate-300 rounded-xl focus:ring-2 focus:ring-blue-600 focus:outline-none"
+                  />
+                </div>
+              </div>
               <div>
                 <label className="block text-xs font-bold text-slate-700 mb-1">Finding Description</label>
                 <textarea
                   rows={2}
                   value={customNotes}
                   onChange={(e) => setCustomNotes(e.target.value)}
-                  placeholder="Describe the observation..."
+                  placeholder="Describe the non-conformance and required corrective action..."
                   className="w-full px-3 py-2 text-xs border border-slate-300 rounded-xl focus:ring-2 focus:ring-blue-600 focus:outline-none"
                 />
               </div>
@@ -353,7 +449,7 @@ export const CapView: React.FC<Props> = ({
                 onClick={handleAddCustomCap}
                 className="px-4 py-2 rounded-xl bg-blue-600 hover:bg-blue-700 text-white text-xs font-bold cursor-pointer"
               >
-                Create CAP Item
+                {isAdmin ? 'Issue CAP Item' : 'Create CAP Item'}
               </button>
             </div>
           </div>
@@ -412,23 +508,60 @@ export const CapView: React.FC<Props> = ({
                           {sevMeta.label} ({sevMeta.points} pts)
                         </span>
                       )}
+                      {item.issuedBy && (
+                        <span className="px-2 py-0.5 rounded bg-indigo-100 text-indigo-800 border border-indigo-200 text-[10px] font-bold">
+                          Issued by {item.issuedBy}
+                        </span>
+                      )}
                     </div>
                     <h3 className="text-sm sm:text-base font-black text-slate-900">
                       {item.checkpointTitle}
                     </h3>
                   </div>
 
-                  <span
-                    className={`px-3 py-1 rounded-full text-[11px] font-black uppercase tracking-wide shrink-0 self-start sm:self-center ${
-                      isClosed
-                        ? 'bg-emerald-600 text-white'
-                        : isInProgress
-                        ? 'bg-amber-500 text-slate-950'
-                        : 'bg-red-600 text-white'
-                    }`}
-                  >
-                    {isClosed ? 'Closed (Verified)' : isInProgress ? 'In Progress' : 'Open'}
-                  </span>
+                  <div className="flex items-center gap-2 shrink-0 self-start sm:self-center">
+                    <span
+                      className={`px-3 py-1 rounded-full text-[11px] font-black uppercase tracking-wide ${
+                        isClosed
+                          ? 'bg-emerald-600 text-white'
+                          : isInProgress
+                          ? 'bg-amber-500 text-slate-950'
+                          : 'bg-red-600 text-white'
+                      }`}
+                    >
+                      {isClosed ? 'Closed (Verified)' : isInProgress ? 'In Progress' : 'Open'}
+                    </span>
+
+                    {isAdmin && (
+                      confirmRemoveId === item.id ? (
+                        <div className="flex items-center gap-1">
+                          <button
+                            type="button"
+                            onClick={() => handleRemoveCapItem(item)}
+                            className="px-2 py-1 rounded-lg bg-red-600 hover:bg-red-700 text-white text-[10px] font-bold cursor-pointer"
+                          >
+                            Remove?
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setConfirmRemoveId(null)}
+                            className="px-2 py-1 rounded-lg bg-slate-200 text-slate-700 text-[10px] font-bold cursor-pointer"
+                          >
+                            Cancel
+                          </button>
+                        </div>
+                      ) : (
+                        <button
+                          type="button"
+                          onClick={() => setConfirmRemoveId(item.id)}
+                          className="p-1.5 rounded-lg text-slate-400 hover:text-red-600 hover:bg-red-100/70 transition-colors cursor-pointer"
+                          title="Admin: Remove this CAP item"
+                        >
+                          <Trash2 className="w-4 h-4" />
+                        </button>
+                      )
+                    )}
+                  </div>
                 </div>
 
                 <div className="p-4 sm:p-5 space-y-4">

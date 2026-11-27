@@ -9,6 +9,10 @@
           "type": "string",
           "description": "Unique report ID"
         },
+        "auditorEmail": {
+          "type": "string",
+          "description": "Email of the auditor who owns this report"
+        },
         "factoryInfo": {
           "type": "object",
           "description": "Factory identification and pre-audit metadata"
@@ -16,6 +20,10 @@
         "sections": {
           "type": "array",
           "description": "Audit sections and checkpoint scoring"
+        },
+        "capItems": {
+          "type": "array",
+          "description": "Corrective Action Plan items and closure records"
         },
         "overallPercentage": {
           "type": "number",
@@ -38,36 +46,68 @@
     },
     "auditDraft": {
       "title": "Active Audit Draft",
-      "description": "Real-time working draft synced across mobile and desktop devices",
+      "description": "Real-time working draft synced per auditor email across mobile and desktop devices",
       "type": "object",
       "properties": {
+        "ownerEmail": {
+          "type": "string",
+          "description": "Normalized email of the auditor owning this draft"
+        },
         "factoryInfo": {
           "type": "object",
-          "description": "Pre-audit factory data and photos"
+          "description": "Pre-audit factory data and photo references"
         },
         "sections": {
           "type": "array",
-          "description": "Checkpoints and evidence photos"
+          "description": "Checkpoints and evidence photo references"
         },
-        "lastUpdated": {
+        "updatedAt": {
           "type": "string",
           "description": "ISO timestamp of draft mutation"
         },
-        "clientId": {
+        "senderClientId": {
           "type": "string",
           "description": "Client device identifier"
         }
       }
+    },
+    "draftPhoto": {
+      "title": "Cloud Photo Document",
+      "description": "Compressed inspection photo stored per-image for reliable live cross-device sync",
+      "type": "object",
+      "properties": {
+        "photoId": {
+          "type": "string",
+          "description": "Unique photo document key"
+        },
+        "ownerEmail": {
+          "type": "string",
+          "description": "Owner auditor email"
+        },
+        "dataUrl": {
+          "type": "string",
+          "description": "Compressed image data URL"
+        },
+        "updatedAt": {
+          "type": "string",
+          "description": "ISO timestamp"
+        }
+      },
+      "required": ["photoId", "dataUrl"]
     }
   },
   "firestore": {
-    "/audits/{auditId}": {
+    "/audit_reports/{auditId}": {
       "schema": "auditReport",
       "description": "Saved completed or historical audit reports"
     },
-    "/drafts/{draftId}": {
+    "/active_drafts/{draftId}": {
       "schema": "auditDraft",
-      "description": "Active in-progress audit drafts synced in real time"
+      "description": "Active in-progress audit drafts synced in real time per auditor email"
+    },
+    "/draft_photos/{photoId}": {
+      "schema": "draftPhoto",
+      "description": "Individual inspection photos synced across mobile and PC"
     }
   }
 }

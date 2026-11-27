@@ -20,15 +20,37 @@ import {
   Camera,
   ClipboardCheck,
   Mail,
+  ShieldCheck,
+  Edit3,
+  Plus,
+  Trash2,
+  X,
 } from 'lucide-react';
-import { AuditReportData, CheckpointEvidence, SCORE_DEFINITIONS } from '../types/audit';
+import {
+  AuditReportData,
+  AuditorUser,
+  CheckpointEvidence,
+  SCORE_DEFINITIONS,
+  ScoreOption,
+} from '../types/audit';
 import { generateAuditPdf } from '../utils/pdfGenerator';
 import { getScoreBandMeta } from '../utils/scoring';
+import { isAuditorAdmin } from '../services/firebase';
 
 interface Props {
   report: AuditReportData;
+  currentUser?: AuditorUser | null;
   onEditSection: (sectionId: string) => void;
+  onEditPreAudit?: () => void;
   onSaveReport: (report: AuditReportData) => Promise<void>;
+  onUpdateReportFields?: (updatedReport: AuditReportData) => Promise<void> | void;
+  onAddFindingToReport?: (payload: {
+    sectionId: string;
+    title: string;
+    score: Exclude<ScoreOption, null>;
+    notes: string;
+  }) => Promise<void> | void;
+  onRemoveCheckpointFromReport?: (sectionId: string, checkpointId: string) => Promise<void> | void;
   onOpenPreviewImage: (evidence: CheckpointEvidence) => void;
   onOpenShareModal?: () => void;
   onOpenCap?: () => void;
@@ -37,13 +59,19 @@ interface Props {
 
 export const ReportView: React.FC<Props> = ({
   report,
+  currentUser,
   onEditSection,
+  onEditPreAudit,
   onSaveReport,
+  onUpdateReportFields,
+  onAddFindingToReport,
+  onRemoveCheckpointFromReport,
   onOpenPreviewImage,
   onOpenShareModal,
   onOpenCap,
   onEmailReport,
 }) => {
+  const isAdmin = isAuditorAdmin(currentUser?.email);
   const [downloading, setDownloading] = useState(false);
   const [saving, setSaving] = useState(false);
   const [saveSuccess, setSaveSuccess] = useState(false);
@@ -52,10 +80,44 @@ export const ReportView: React.FC<Props> = ({
     report.sectionSummaries.filter((s) => s.percentage < 70 || s.criticalCount > 0).map((s) => s.sectionId)
   );
 
+  // Admin inline Executive Summary editor state
+  const [isEditingSummary, setIsEditingSummary] = useState(false);
+  const [summaryDraft, setSummaryDraft] = useState(report.executiveSummary || '');
+
+  // Admin Add Finding modal state
+  const [showAddFindingModal, setShowAddFindingModal] = useState(false);
+  const [findingSectionId, setFindingSectionId] = useState(report.sections[0]?.id || 'warehouse');
+  const [findingTitle, setFindingTitle] = useState('');
+  const [findingScore, setFindingScore] = useState<Exclude<ScoreOption, null>>('major');
+  const [findingNotes, setFindingNotes] = useState('');
+  const [confirmRemoveFindingId, setConfirmRemoveFindingId] = useState<string | null>(null);
+
   const toggleCapSection = (sectionId: string) => {
     setSelectedCapSections((prev) =>
       prev.includes(sectionId) ? prev.filter((id) => id !== sectionId) : [...prev, sectionId]
     );
+  };
+
+  const handleSaveSummary = async () => {
+    if (!onUpdateReportFields) return;
+    await onUpdateReportFields({
+      ...report,
+      executiveSummary: summaryDraft.trim(),
+    });
+    setIsEditingSummary(false);
+  };
+
+  const handleSubmitNewFinding = async () => {
+    if (!onAddFindingToReport || !findingTitle.trim()) return;
+    await onAddFindingToReport({
+      sectionId: findingSectionId,
+      title: findingTitle.trim(),
+      score: findingScore,
+      notes: findingNotes.trim(),
+    });
+    setFindingTitle('');
+    setFindingNotes('');
+    setShowAddFindingModal(false);
   };
 
   const scoreBand = getScoreBandMeta(report.overallPercentage, report.totalCritical);
@@ -210,6 +272,152 @@ export const ReportView: React.FC<Props> = ({
         </div>
       </div>
 
+      {/* Admin Report Control Bar (Strictly visible only to Admin quality.bd.eng@gmail.com) */}
+      {isAdmin && (
+        <div className="bg-gradient-to-r from-indigo-50 via-blue-50 to-slate-50 border border-indigo-200 rounded-2xl px-4 py-3 flex flex-col lg:flex-row lg:items-center justify-between gap-3 shadow-xs">
+          <div className="flex items-center gap-2 text-xs">
+            <ShieldCheck className="w-4 h-4 text-indigo-700 shrink-0" />
+            <div>
+              <span className="font-black text-indigo-950">Admin Report Controls</span>
+              <span className="text-indigo-700 ml-2">
+                {report.auditorEmail ? `Auditor: ${report.auditorEmail}` : 'Full Edit, Add/Remove & CAP Access'}
+              </span>
+            </div>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2">
+            {onEditPreAudit && (
+              <button
+                type="button"
+                onClick={onEditPreAudit}
+                className="px-3 py-1.5 rounded-xl bg-white hover:bg-indigo-100 text-indigo-800 border border-indigo-200 text-xs font-bold flex items-center gap-1.5 cursor-pointer transition-colors"
+              >
+                <Edit3 className="w-3.5 h-3.5" />
+                <span>Edit Factory / Pre-Audit</span>
+              </button>
+            )}
+
+            <button
+              type="button"
+              onClick={() => onEditSection(report.sections[0]?.id || 'warehouse')}
+              className="px-3 py-1.5 rounded-xl bg-white hover:bg-indigo-100 text-indigo-800 border border-indigo-200 text-xs font-bold flex items-center gap-1.5 cursor-pointer transition-colors"
+            >
+              <Edit3 className="w-3.5 h-3.5" />
+              <span>Edit Checkpoints &amp; Photos</span>
+            </button>
+
+            {onAddFindingToReport && (
+              <button
+                type="button"
+                onClick={() => {
+                  setFindingSectionId(report.sections[0]?.id || 'warehouse');
+                  setShowAddFindingModal(true);
+                }}
+                className="px-3 py-1.5 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-bold flex items-center gap-1.5 cursor-pointer shadow-xs transition-colors"
+              >
+                <Plus className="w-3.5 h-3.5" />
+                <span>Add Finding / Checkpoint</span>
+              </button>
+            )}
+
+            {onOpenCap && (
+              <button
+                type="button"
+                onClick={onOpenCap}
+                className="px-3 py-1.5 rounded-xl bg-amber-500 hover:bg-amber-600 text-slate-950 text-xs font-bold flex items-center gap-1.5 cursor-pointer shadow-xs transition-colors"
+              >
+                <ClipboardCheck className="w-3.5 h-3.5" />
+                <span>Issue / Close CAP</span>
+              </button>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* Admin Add Finding Modal */}
+      {isAdmin && showAddFindingModal && (
+        <div className="fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-xs flex items-center justify-center p-4">
+          <div className="bg-white rounded-2xl max-w-lg w-full p-5 shadow-2xl border border-slate-200 space-y-4">
+            <div className="flex items-center justify-between">
+              <h3 className="text-base font-black text-slate-900">Add New Finding / Checkpoint to Report</h3>
+              <button
+                type="button"
+                onClick={() => setShowAddFindingModal(false)}
+                className="p-1 text-slate-400 hover:text-slate-700 cursor-pointer"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+            <div className="space-y-3">
+              <div>
+                <label className="block text-xs font-bold text-slate-700 mb-1">Audit Section</label>
+                <select
+                  value={findingSectionId}
+                  onChange={(e) => setFindingSectionId(e.target.value)}
+                  className="w-full px-3 py-2 text-xs border border-slate-300 rounded-xl bg-white focus:ring-2 focus:ring-blue-600 focus:outline-none font-semibold"
+                >
+                  {report.sections.map((s) => (
+                    <option key={s.id} value={s.id}>
+                      {s.name}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <div>
+                <label className="block text-xs font-bold text-slate-700 mb-1">Finding / Checkpoint Title *</label>
+                <input
+                  type="text"
+                  value={findingTitle}
+                  onChange={(e) => setFindingTitle(e.target.value)}
+                  placeholder="e.g. Metal detector calibration log missing for Line 4"
+                  className="w-full px-3 py-2 text-xs border border-slate-300 rounded-xl focus:ring-2 focus:ring-blue-600 focus:outline-none"
+                />
+              </div>
+              <div>
+                <label className="block text-xs font-bold text-slate-700 mb-1">Evaluation Score / Severity</label>
+                <select
+                  value={findingScore}
+                  onChange={(e) => setFindingScore(e.target.value as Exclude<ScoreOption, null>)}
+                  className="w-full px-3 py-2 text-xs border border-slate-300 rounded-xl bg-white focus:ring-2 focus:ring-blue-600 focus:outline-none font-semibold"
+                >
+                  <option value="critical">Not Accepted (0 pts - Critical)</option>
+                  <option value="major">Below Expectation (3 pts - Major)</option>
+                  <option value="minor">Acceptable (7 pts - Minor)</option>
+                  <option value="none">Good (10 pts - Compliant)</option>
+                  <option value="na">N/A (Not Applicable)</option>
+                </select>
+              </div>
+              <div>
+                <label className="block text-xs font-bold text-slate-700 mb-1">Observation / Technical Notes</label>
+                <textarea
+                  rows={3}
+                  value={findingNotes}
+                  onChange={(e) => setFindingNotes(e.target.value)}
+                  placeholder="Enter detailed technical finding..."
+                  className="w-full px-3 py-2 text-xs border border-slate-300 rounded-xl focus:ring-2 focus:ring-blue-600 focus:outline-none"
+                />
+              </div>
+            </div>
+            <div className="flex items-center justify-end gap-2 pt-2">
+              <button
+                type="button"
+                onClick={() => setShowAddFindingModal(false)}
+                className="px-3.5 py-2 rounded-xl bg-slate-100 text-slate-700 text-xs font-bold cursor-pointer"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={handleSubmitNewFinding}
+                className="px-4 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-bold cursor-pointer"
+              >
+                Add &amp; Recalculate Score
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* 1. OVERALL AUDIT SCORECARD HERO */}
       <div
         className={`rounded-2xl p-6 border shadow-sm transition-all ${
@@ -297,9 +505,55 @@ export const ReportView: React.FC<Props> = ({
                     : 'Audit Status: Non-Compliant (Red Mark <50% or Critical Issue)'}
                 </h2>
               </div>
-              <p className="text-xs text-slate-600 mt-1 leading-relaxed">
-                {report.executiveSummary}
-              </p>
+              {isAdmin && isEditingSummary ? (
+                <div className="mt-2 space-y-2">
+                  <textarea
+                    rows={3}
+                    value={summaryDraft}
+                    onChange={(e) => setSummaryDraft(e.target.value)}
+                    className="w-full px-3 py-2 text-xs border border-indigo-300 rounded-xl bg-white focus:ring-2 focus:ring-indigo-500 focus:outline-none"
+                  />
+                  <div className="flex items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={handleSaveSummary}
+                      className="px-3 py-1 rounded-lg bg-indigo-600 text-white text-xs font-bold cursor-pointer"
+                    >
+                      Save Summary
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setSummaryDraft(report.executiveSummary || '');
+                        setIsEditingSummary(false);
+                      }}
+                      className="px-3 py-1 rounded-lg bg-slate-200 text-slate-700 text-xs font-bold cursor-pointer"
+                    >
+                      Cancel
+                    </button>
+                  </div>
+                </div>
+              ) : (
+                <div className="mt-1 flex items-start justify-between gap-2">
+                  <p className="text-xs text-slate-600 leading-relaxed flex-1">
+                    {report.executiveSummary}
+                  </p>
+                  {isAdmin && onUpdateReportFields && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setSummaryDraft(report.executiveSummary || '');
+                        setIsEditingSummary(true);
+                      }}
+                      className="px-2 py-1 rounded-lg bg-white/80 hover:bg-indigo-50 border border-indigo-200 text-indigo-700 text-[10px] font-bold flex items-center gap-1 shrink-0 cursor-pointer"
+                      title="Admin: Edit Executive Summary / Comments"
+                    >
+                      <Edit3 className="w-3 h-3" />
+                      <span>Edit Comment</span>
+                    </button>
+                  )}
+                </div>
+              )}
             </div>
 
             {/* 4 Issue Severity Counters: Exactly aligned with Checkpoint Scoring */}
@@ -771,7 +1025,7 @@ export const ReportView: React.FC<Props> = ({
                   <div className="space-y-3">
                     <div className="flex flex-col sm:flex-row sm:items-start justify-between gap-2">
                       <div className="space-y-1 flex-1">
-                        <div className="flex items-center gap-2">
+                        <div className="flex flex-wrap items-center gap-2">
                           <span className="px-2 py-0.5 rounded text-[10px] font-mono font-bold bg-white border border-slate-200 text-slate-800">
                             {nc.code}
                           </span>
@@ -793,6 +1047,54 @@ export const ReportView: React.FC<Props> = ({
                           </div>
                         )}
                       </div>
+
+                      {isAdmin && (
+                        <div className="flex items-center gap-1.5 shrink-0">
+                          <button
+                            type="button"
+                            onClick={() => onEditSection(nc.sectionId)}
+                            className="px-2.5 py-1 rounded-lg bg-white hover:bg-blue-50 text-blue-700 border border-blue-200 text-[11px] font-bold flex items-center gap-1 cursor-pointer"
+                            title="Edit this checkpoint"
+                          >
+                            <Edit3 className="w-3 h-3" />
+                            <span>Edit</span>
+                          </button>
+
+                          {onRemoveCheckpointFromReport && (
+                            confirmRemoveFindingId === nc.id ? (
+                              <div className="flex items-center gap-1">
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    onRemoveCheckpointFromReport(nc.sectionId, nc.id);
+                                    setConfirmRemoveFindingId(null);
+                                  }}
+                                  className="px-2 py-1 rounded-lg bg-red-600 hover:bg-red-700 text-white text-[10px] font-bold cursor-pointer"
+                                >
+                                  Confirm Remove
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => setConfirmRemoveFindingId(null)}
+                                  className="px-2 py-1 rounded-lg bg-slate-200 text-slate-700 text-[10px] font-bold cursor-pointer"
+                                >
+                                  Cancel
+                                </button>
+                              </div>
+                            ) : (
+                              <button
+                                type="button"
+                                onClick={() => setConfirmRemoveFindingId(nc.id)}
+                                className="px-2.5 py-1 rounded-lg bg-white hover:bg-red-50 text-red-600 border border-red-200 text-[11px] font-bold flex items-center gap-1 cursor-pointer"
+                                title="Admin: Remove this finding from report"
+                              >
+                                <Trash2 className="w-3 h-3" />
+                                <span>Remove</span>
+                              </button>
+                            )
+                          )}
+                        </div>
+                      )}
                     </div>
 
                     {/* ALL MULTIPLE PHOTOS VISIBLE HERE */}

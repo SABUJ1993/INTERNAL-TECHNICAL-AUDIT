@@ -5,7 +5,7 @@ import path from 'path';
 import { defineConfig, Plugin } from 'vite';
 import { VitePWA } from 'vite-plugin-pwa';
 
-const APP_VERSION = '2.9.0';
+const APP_VERSION = '2.10.0';
 const BUILD_TIME = Date.now();
 const RAW_BASE_PATH = process.env.VITE_BASE_PATH || '/';
 const BASE_PATH = RAW_BASE_PATH.endsWith('/') ? RAW_BASE_PATH : `${RAW_BASE_PATH}/`;

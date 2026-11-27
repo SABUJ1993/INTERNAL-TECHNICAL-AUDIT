@@ -192,6 +192,7 @@ export interface AuditReportData {
   submittedAt?: string;
   capItems?: CapItem[];
   capUpdatedAt?: string;
+  dismissedCapIds?: string[];
 }
 
 export type CapStatus = 'open' | 'in-progress' | 'closed';
@@ -215,6 +216,8 @@ export interface CapItem {
   closureImages: CheckpointEvidence[];
   closedAt?: string;
   verifiedBy?: string;
+  issuedBy?: string;
+  issuedAt?: string;
 }
 
 export interface AuditorUser {

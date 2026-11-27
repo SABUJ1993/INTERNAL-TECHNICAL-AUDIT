@@ -5,6 +5,7 @@ import { AuditReportData, CapItem } from '../types/audit';
  * while preserving any existing CAP root-cause, corrective actions, closure status, and closure photos.
  */
 export function buildCapItemsFromReport(report: AuditReportData): CapItem[] {
+  const dismissedSet = new Set<string>(report.dismissedCapIds || []);
   const existingMap = new Map<string, CapItem>();
   (report.capItems || []).forEach((item) => {
     existingMap.set(item.checkpointId || item.id, item);
@@ -16,6 +17,9 @@ export function buildCapItemsFromReport(report: AuditReportData): CapItem[] {
   report.sections.forEach((sec) => {
     sec.checkpoints.forEach((cp) => {
       if (cp.score === 'critical' || cp.score === 'major' || cp.score === 'minor') {
+        if (dismissedSet.has(cp.id) || dismissedSet.has(`cap-${cp.id}`)) {
+          return;
+        }
         const existing = existingMap.get(cp.id);
         seenIds.add(cp.id);
 
@@ -56,9 +60,10 @@ export function buildCapItemsFromReport(report: AuditReportData): CapItem[] {
     });
   });
 
-  // Also preserve any custom manually-opened CAP items
+  // Also preserve any custom manually-opened / Admin-issued CAP items
   (report.capItems || []).forEach((item) => {
-    if (!seenIds.has(item.checkpointId || item.id) && item.id.startsWith('cap-custom-')) {
+    const key = item.checkpointId || item.id;
+    if (!seenIds.has(key) && !dismissedSet.has(key) && !dismissedSet.has(item.id) && item.id.startsWith('cap-custom-')) {
       derived.push(item);
     }
   });
