@@ -128,6 +128,7 @@ export interface FactoryInfo {
   contactPerson: string;
   contactPhone: string;
   contactEmail: string;
+  contactEmails?: string[];
   auditDate: string;
   auditDuration?: string;
   auditDurationSeconds?: number;
@@ -187,6 +188,33 @@ export interface AuditReportData {
   totalNoIssue: number;
   auditorSignature?: string;
   executiveSummary?: string;
+  auditorEmail?: string;
+  submittedAt?: string;
+  capItems?: CapItem[];
+  capUpdatedAt?: string;
+}
+
+export type CapStatus = 'open' | 'in-progress' | 'closed';
+
+export interface CapItem {
+  id: string;
+  checkpointId: string;
+  sectionId: string;
+  sectionName: string;
+  checkpointCode: string;
+  checkpointTitle: string;
+  originalScore: Exclude<ScoreOption, null>;
+  originalNotes: string;
+  originalImages: CheckpointEvidence[];
+  rootCause: string;
+  correctiveAction: string;
+  responsiblePerson: string;
+  targetDate: string;
+  status: CapStatus;
+  closureNotes: string;
+  closureImages: CheckpointEvidence[];
+  closedAt?: string;
+  verifiedBy?: string;
 }
 
 export interface AuditorUser {
@@ -199,4 +227,4 @@ export interface AuditorUser {
 }
 
 export type ViewMode = 'auto' | 'android' | 'windows';
-export type AppTab = 'pre-audit' | 'audit' | 'report' | 'saved-audits';
+export type AppTab = 'pre-audit' | 'audit' | 'report' | 'cap' | 'saved-audits';

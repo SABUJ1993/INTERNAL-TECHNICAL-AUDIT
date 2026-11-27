@@ -1,5 +1,11 @@
 import { jsPDF } from 'jspdf';
-import { AuditReportData, SCORE_DEFINITIONS } from '../types/audit';
+import {
+  AuditReportData,
+  CapItem,
+  CheckpointEvidence,
+  SCORE_DEFINITIONS,
+  SectionScoreSummary,
+} from '../types/audit';
 import { getScoreBandMeta } from './scoring';
 
 export interface GeneratePdfOptions {
@@ -7,10 +13,192 @@ export interface GeneratePdfOptions {
   selectedCapSectionIds?: string[];
 }
 
-export async function generateAuditPdf(
+interface BuiltPdfResult {
+  doc: jsPDF;
+  fileName: string;
+}
+
+function getSafeImageFormat(dataUrl: string): 'JPEG' | 'PNG' {
+  if (dataUrl.startsWith('data:image/png')) return 'PNG';
+  return 'JPEG';
+}
+
+function drawSegmentedBar(
+  doc: jsPDF,
+  x: number,
+  y: number,
+  width: number,
+  height: number,
+  counts: { critical: number; major: number; minor: number; none: number; na: number }
+) {
+  const total = counts.critical + counts.major + counts.minor + counts.none + counts.na;
+  if (total <= 0) {
+    doc.setFillColor(15, 23, 42);
+    doc.rect(x, y, width, height, 'F');
+    return;
+  }
+
+  const segments: Array<{ count: number; rgb: [number, number, number] }> = [
+    { count: counts.critical, rgb: [220, 38, 38] }, // Red
+    { count: counts.major, rgb: [245, 158, 11] }, // Amber
+    { count: counts.minor, rgb: [59, 130, 246] }, // Blue
+    { count: counts.none, rgb: [77, 155, 88] }, // Green
+    { count: counts.na, rgb: [156, 163, 175] }, // Gray
+  ];
+
+  let curX = x;
+  segments.forEach((seg, idx) => {
+    if (seg.count <= 0) return;
+    const segW = idx === segments.length - 1 ? x + width - curX : (seg.count / total) * width;
+    if (segW > 0.2) {
+      doc.setFillColor(seg.rgb[0], seg.rgb[1], seg.rgb[2]);
+      doc.rect(curX, y, segW, height, 'F');
+      curX += segW;
+    }
+  });
+}
+
+function drawWrappedPillBadges(
+  doc: jsPDF,
+  items: string[],
+  startX: number,
+  startY: number,
+  maxWidth: number
+): number {
+  if (!items || items.length === 0) return 5.5;
+  doc.setFont('helvetica', 'bold');
+  doc.setFontSize(6.5);
+
+  let curX = startX;
+  let curY = startY;
+  const pillH = 4.2;
+  const gapX = 1.5;
+  const gapY = 1.5;
+
+  items.forEach((raw) => {
+    const label = String(raw || '').trim();
+    if (!label) return;
+    const textW = doc.getTextWidth(label);
+    const pillW = Math.min(textW + 4, maxWidth);
+    if (curX + pillW > startX + maxWidth && curX > startX) {
+      curX = startX;
+      curY += pillH + gapY;
+    }
+    doc.setFillColor(71, 85, 105);
+    doc.roundedRect(curX, curY, pillW, pillH, 0.8, 0.8, 'F');
+    doc.setTextColor(255, 255, 255);
+    doc.text(label, curX + 2, curY + 3, { maxWidth: pillW - 3 });
+    curX += pillW + gapX;
+  });
+
+  return curY - startY + pillH + 1.5;
+}
+
+function drawPhotoGrid4Col(
+  doc: jsPDF,
+  photos: Array<{ dataUrl: string; label?: string }>,
+  margin: number,
+  contentWidth: number,
+  y: number,
+  checkPageBreak: (needed: number) => void
+): number {
+  const validPhotos = photos.filter(
+    (p) => p.dataUrl && (p.dataUrl.startsWith('data:image/') || p.dataUrl.startsWith('http'))
+  );
+  if (validPhotos.length === 0) return y;
+
+  const cols = 4;
+  const gap = 3;
+  const cellW = (contentWidth - gap * (cols - 1)) / cols;
+  const cellH = 29;
+  const rowStep = cellH + 5.5;
+
+  let curY = y;
+  for (let i = 0; i < validPhotos.length; i += cols) {
+    checkPageBreak(rowStep + 2);
+    // Re-read current y after potential page break by reading closure? We handle via return value below.
+    break;
+  }
+
+  for (let i = 0; i < validPhotos.length; i++) {
+    const col = i % cols;
+    if (col === 0) {
+      if (curY + rowStep > doc.internal.pageSize.getHeight() - 16) {
+        doc.addPage();
+        curY = margin;
+      }
+    }
+    const px = margin + col * (cellW + gap);
+    const photo = validPhotos[i];
+
+    // Subtle crisp frame
+    doc.setDrawColor(203, 213, 225);
+    doc.setFillColor(248, 250, 252);
+    doc.setLineWidth(0.2);
+    doc.rect(px, curY, cellW, cellH, 'FD');
+
+    try {
+      doc.addImage(
+        photo.dataUrl,
+        getSafeImageFormat(photo.dataUrl),
+        px + 0.4,
+        curY + 0.4,
+        cellW - 0.8,
+        cellH - 0.8,
+        undefined,
+        'FAST'
+      );
+    } catch (e) {
+      console.warn('Could not add image to PDF grid', e);
+    }
+
+    if (photo.label) {
+      doc.setFont('helvetica', 'normal');
+      doc.setFontSize(6);
+      doc.setTextColor(71, 85, 105);
+      const trimmedLabel = photo.label.length > 26 ? `${photo.label.slice(0, 24)}..` : photo.label;
+      doc.text(trimmedLabel, px + 0.5, curY + cellH + 3.2);
+    }
+
+    if (col === cols - 1 || i === validPhotos.length - 1) {
+      curY += rowStep;
+    }
+  }
+
+  return curY;
+}
+
+function applyPageFooters(doc: jsPDF, factoryName: string, auditDate: string, margin: number) {
+  const totalPages = (doc as any).internal.getNumberOfPages();
+  const pageWidth = doc.internal.pageSize.getWidth();
+  const pageHeight = doc.internal.pageSize.getHeight();
+
+  for (let i = 1; i <= totalPages; i++) {
+    doc.setPage(i);
+    doc.setDrawColor(226, 232, 240);
+    doc.setLineWidth(0.2);
+    doc.line(margin, pageHeight - 11, pageWidth - margin, pageHeight - 11);
+
+    doc.setFont('helvetica', 'normal');
+    doc.setFontSize(7.5);
+    doc.setTextColor(100, 116, 139);
+    doc.text('Internal Technical Audit Suite', margin, pageHeight - 6.5);
+
+    doc.setFont('helvetica', 'bold');
+    doc.setTextColor(51, 65, 85);
+    doc.text(
+      `Factory: ${factoryName || 'Factory'}   |   ${auditDate}   |   Page ${i} of ${totalPages}`,
+      pageWidth - margin,
+      pageHeight - 6.5,
+      { align: 'right' }
+    );
+  }
+}
+
+async function buildAuditPdfDocument(
   report: AuditReportData,
   options?: GeneratePdfOptions
-): Promise<void> {
+): Promise<BuiltPdfResult> {
   const doc = new jsPDF({
     orientation: 'portrait',
     unit: 'mm',
@@ -19,531 +207,559 @@ export async function generateAuditPdf(
 
   const pageWidth = doc.internal.pageSize.getWidth();
   const pageHeight = doc.internal.pageSize.getHeight();
-  const margin = 14;
+  const margin = 12;
   const contentWidth = pageWidth - margin * 2;
   let y = margin;
-
-  const scoreBand = getScoreBandMeta(report.overallPercentage, report.totalCritical);
 
   const checkPageBreak = (neededHeight: number) => {
     if (y + neededHeight > pageHeight - 16) {
       doc.addPage();
       y = margin;
-      drawHeaderFooter();
     }
   };
 
-  const drawHeaderFooter = () => {
-    // Header minimal bar
-    doc.setFillColor(15, 23, 42); // slate-900
-    doc.rect(0, 0, pageWidth, 4, 'F');
+  const factoryName = report.factoryInfo.name || 'Factory';
+  const auditDate = report.factoryInfo.auditDate || new Date().toISOString().split('T')[0];
+  const auditType = report.factoryInfo.auditType || 'Annual Audit';
+  const auditor1 = report.factoryInfo.auditorName || 'Lead Auditor';
+  const auditor2 = report.factoryInfo.auditor2Name?.trim();
+  const auditorDisplay = auditor2 ? `${auditor1} & ${auditor2}` : auditor1;
+  const reportNo = report.factoryInfo.auditReportNo || report.factoryInfo.factoryRegistrationNo || report.id || 'N/A';
+  const contactEmailsStr =
+    report.factoryInfo.contactEmails && report.factoryInfo.contactEmails.length > 0
+      ? report.factoryInfo.contactEmails.join(', ')
+      : report.factoryInfo.contactEmail || 'N/A';
 
-    // Footer - ONLY "Internal Technical Audit Report" (NO factory name like apex)
-    const totalPages = (doc as any).internal.getNumberOfPages();
-    const currentPage = (doc as any).internal.getCurrentPageInfo().pageNumber;
-    doc.setFontSize(8);
-    doc.setTextColor(100, 116, 139);
-    doc.text(
-      'Internal Technical Audit Report',
-      margin,
-      pageHeight - 8
-    );
-    doc.text(`Page ${currentPage} of ${totalPages}`, pageWidth - margin - 15, pageHeight - 8);
-  };
+  const scoreBand = getScoreBandMeta(report.overallPercentage, report.totalCritical);
 
-  // --- COVER / HEADER ---
-  doc.setFillColor(15, 23, 42);
-  doc.roundedRect(margin, y, contentWidth, 28, 2, 2, 'F');
-
+  // --- 1. QARMA-STYLE CLEAN HEADER ---
   doc.setFont('helvetica', 'bold');
-  doc.setFontSize(15);
-  doc.setTextColor(255, 255, 255);
-  doc.text('INTERNAL TECHNICAL AUDIT REPORT', margin + 6, y + 11);
-
-  const auditorDisplayName = report.factoryInfo.auditorName || 'Lead Auditor';
-  const auditorTitleName = (report.factoryInfo.auditorTitle || 'Lead QMS Auditor').replace(/\s*\(Admin\)/gi, '').trim();
-  const auditor2DisplayName = report.factoryInfo.auditor2Name;
-  const auditor2TitleName = (report.factoryInfo.auditor2Title || 'Technical Auditor').replace(/\s*\(Admin\)/gi, '').trim();
-  const auditReportNo = report.factoryInfo.auditReportNo || report.factoryInfo.factoryRegistrationNo || 'N/A';
-
-  const auditorHeaderString = auditor2DisplayName
-    ? `Auditor-1: ${auditorDisplayName} (${auditorTitleName})  |  Auditor-2: ${auditor2DisplayName} (${auditor2TitleName})`
-    : `Auditor-1: ${auditorDisplayName} (${auditorTitleName})`;
-
-  doc.setFont('helvetica', 'normal');
-  doc.setFontSize(7.5);
-  doc.setTextColor(203, 213, 225);
-  doc.text(
-    `Report No: ${auditReportNo}  |  Type: ${report.factoryInfo.auditType || 'Annual Audit'}  |  Date: ${report.factoryInfo.auditDate || new Date().toISOString().split('T')[0]}`,
-    margin + 6,
-    y + 19
-  );
-  doc.text(
-    auditorHeaderString,
-    margin + 6,
-    y + 24
-  );
-
-  y += 33;
-
-  // --- SCORECARD HERO CARD ---
-  // Color coding requested:
-  // < 50: Red Mark
-  // 60 - 79.99: Amber Mark
-  // >= 80: Deep Green Mark
-  const [r, g, b] = scoreBand.rgb;
-  const isRed = scoreBand.band === 'red';
-  const isAmber = scoreBand.band === 'amber';
-
-  const scoreCardBg = isRed ? [254, 242, 242] : isAmber ? [254, 252, 232] : [240, 253, 244];
-  const scoreCardBorder = [r, g, b];
-
-  doc.setFillColor(scoreCardBg[0], scoreCardBg[1], scoreCardBg[2]);
-  doc.setDrawColor(scoreCardBorder[0], scoreCardBorder[1], scoreCardBorder[2]);
-  doc.setLineWidth(0.8);
-  doc.roundedRect(margin, y, contentWidth, 34, 3, 3, 'FD');
-
-  // Left side: score percentage box with exact color coding
-  doc.setFillColor(r, g, b);
-  doc.roundedRect(margin + 4, y + 4, 38, 26, 2, 2, 'F');
-  doc.setFont('helvetica', 'bold');
-  doc.setFontSize(20);
-  doc.setTextColor(255, 255, 255);
-  doc.text(`${report.overallPercentage}%`, margin + 23, y + 18, { align: 'center' });
-  doc.setFontSize(7.5);
-  doc.text('AUDIT SCORE', margin + 23, y + 25, { align: 'center' });
-
-  // Center: Overall Grade & Status
-  doc.setFont('helvetica', 'bold');
-  doc.setFontSize(13);
-  doc.setTextColor(r, g, b);
-  doc.text(scoreBand.label, margin + 46, y + 12);
-
-  doc.setFont('helvetica', 'normal');
-  doc.setFontSize(8.5);
+  doc.setFontSize(9.5);
   doc.setTextColor(71, 85, 105);
-  doc.text(
-    `Earned: ${report.totalScore} / ${report.maxPossibleScore} pts   |   Audited Checkpoints: ${report.sectionSummaries.reduce((acc, s) => acc + s.evaluatedCount, 0)}`,
-    margin + 46,
-    y + 19
-  );
-
-  // Issue Counts Badges
-  const badgeX = margin + 46;
-  const badgeY = y + 23.5;
-  doc.setFontSize(8);
-
-  // Not Accepted (0 pts)
-  doc.setFillColor(239, 68, 68);
-  doc.rect(badgeX, badgeY, 28, 5, 'F');
-  doc.setTextColor(255, 255, 255);
-  doc.text(`Not Accepted: ${report.totalCritical}`, badgeX + 2, badgeY + 3.8);
-
-  // Below Expectation (3 pts)
-  doc.setFillColor(234, 179, 8);
-  doc.rect(badgeX + 30, badgeY, 26, 5, 'F');
-  doc.setTextColor(15, 23, 42);
-  doc.text(`Below Exp: ${report.totalMajor}`, badgeX + 32, badgeY + 3.8);
-
-  // Acceptable (7 pts)
-  doc.setFillColor(37, 99, 235);
-  doc.rect(badgeX + 58, badgeY, 26, 5, 'F');
-  doc.setTextColor(255, 255, 255);
-  doc.text(`Acceptable: ${report.totalMinor}`, badgeX + 60, badgeY + 3.8);
-
-  // Good (10 pts)
-  doc.setFillColor(21, 128, 61); // deep green
-  doc.rect(badgeX + 86, badgeY, 24, 5, 'F');
-  doc.setTextColor(255, 255, 255);
-  doc.text(`Good: ${report.totalNoIssue}`, badgeX + 88, badgeY + 3.8);
-
-  y += 39;
-
-  // --- FACTORY INFO & OPENING MEETING SECTION ---
-  const profileBoxHeight = auditor2DisplayName ? 68 : 62;
-  checkPageBreak(profileBoxHeight + 10);
-  doc.setFont('helvetica', 'bold');
-  doc.setFontSize(10.5);
-  doc.setTextColor(15, 23, 42);
-  doc.text('1. FACTORY PROFILE & OPENING MEETING', margin, y);
-  y += 4;
-
-  const infoColWidth = report.factoryInfo.openingMeetingPhoto ? contentWidth * 0.65 : contentWidth;
-  doc.setDrawColor(226, 232, 240);
-  doc.setFillColor(248, 250, 252);
-  doc.roundedRect(margin, y, infoColWidth, profileBoxHeight, 2, 2, 'FD');
+  doc.text('Audit report', margin, y + 3);
+  y += 6.5;
 
   doc.setFont('helvetica', 'bold');
-  doc.setFontSize(8);
-  doc.setTextColor(71, 85, 105);
+  doc.setFontSize(17);
+  doc.setTextColor(15, 23, 42);
+  const titleLines = doc.splitTextToSize(factoryName.toUpperCase(), contentWidth);
+  doc.text(titleLines, margin, y + 4);
+  y += titleLines.length * 6.5 + 3;
 
-  let infoY = y + 5.0;
-  const printField = (label: string, value: string) => {
-    doc.setFont('helvetica', 'bold');
+  // --- 2. 4-COLUMN BORDERED METADATA GRID ---
+  const c1 = 27;
+  const c2 = 66;
+  const c3 = 29;
+  const c4 = contentWidth - c1 - c2 - c3;
+
+  const metaRows: Array<[string, string, string, string]> = [
+    ['Date', auditDate, 'Auditor', auditorDisplay],
+    ['Audit type', auditType, 'Location', report.factoryInfo.address || 'N/A'],
+    ['Checklist Name', 'Internal Technical Audit Checklist', 'Planned Date', auditDate],
+    ['Supplier Name', factoryName, 'Report No.', reportNo],
+    ['Buyer / Brand', report.factoryInfo.buyerBrand || 'N/A', 'Contact Emails', contactEmailsStr],
+  ];
+
+  doc.setLineWidth(0.2);
+  doc.setDrawColor(100, 116, 139);
+
+  metaRows.forEach(([l1, v1, l2, v2]) => {
+    doc.setFontSize(7.5);
+    const v1Lines = doc.splitTextToSize(v1, c2 - 3);
+    const v2Lines = doc.splitTextToSize(v2, c4 - 3);
+    const rowH = Math.max(5.5, Math.max(v1Lines.length, v2Lines.length) * 3.5 + 2.2);
+    checkPageBreak(rowH + 2);
+
+    // Draw 4 cells
+    doc.setFillColor(248, 250, 252);
+    doc.rect(margin, y, c1, rowH, 'FD');
+    doc.setFillColor(255, 255, 255);
+    doc.rect(margin + c1, y, c2, rowH, 'FD');
+    doc.setFillColor(248, 250, 252);
+    doc.rect(margin + c1 + c2, y, c3, rowH, 'FD');
+    doc.setFillColor(255, 255, 255);
+    doc.rect(margin + c1 + c2 + c3, y, c4, rowH, 'FD');
+
+    doc.setFont('helvetica', 'normal');
     doc.setTextColor(100, 116, 139);
-    doc.text(`${label}:`, margin + 4, infoY);
-    doc.setFont('helvetica', 'normal');
-    doc.setTextColor(15, 23, 42);
-    doc.text(value || 'N/A', margin + 36, infoY);
-    infoY += 4.3;
-  };
-
-  printField('Factory Name', report.factoryInfo.name || 'N/A');
-  printField('Audit Report No', auditReportNo);
-  printField('Audit Type', report.factoryInfo.auditType || 'Annual Audit');
-  printField('Audit Date', report.factoryInfo.auditDate || new Date().toISOString().split('T')[0]);
-  printField('Address', report.factoryInfo.address || 'N/A');
-  if (report.factoryInfo.numberOfWorkers) {
-    printField('No. of Workers', report.factoryInfo.numberOfWorkers);
-  }
-  if (report.factoryInfo.numberOfLines) {
-    printField('No. of Lines', report.factoryInfo.numberOfLines);
-  }
-  if (report.factoryInfo.capacityPerMonth) {
-    printField('Monthly Capacity', report.factoryInfo.capacityPerMonth);
-  }
-  printField('Contact Person', report.factoryInfo.contactPerson || 'N/A');
-  if (report.factoryInfo.contactPhone) {
-    printField('Contact Mobile', report.factoryInfo.contactPhone);
-  }
-  if (report.factoryInfo.contactEmail) {
-    printField('Contact Email', report.factoryInfo.contactEmail);
-  }
-  printField('Buyer / Brand', report.factoryInfo.buyerBrand || 'N/A');
-
-  // If opening meeting photo exists
-  if (report.factoryInfo.openingMeetingPhoto) {
-    const photoWidth = contentWidth * 0.32;
-    const photoX = margin + infoColWidth + 3;
-    try {
-      doc.addImage(report.factoryInfo.openingMeetingPhoto, 'JPEG', photoX, y, photoWidth, profileBoxHeight - 6, undefined, 'FAST');
-      doc.setFontSize(7);
-      doc.setTextColor(100, 116, 139);
-      doc.text('Opening Meeting Photo', photoX + 2, y + profileBoxHeight - 2);
-    } catch (e) {
-      console.warn('Error adding opening meeting image to PDF', e);
-    }
-  }
-
-  y += profileBoxHeight + 5;
-
-  // --- FACTORY OUTLOOK / EXTERIOR MULTIPLE PHOTOS ---
-  const outlookPhotos = report.factoryInfo.factoryOutlookPhotos || [];
-  if (outlookPhotos.length > 0) {
-    checkPageBreak(38);
-    doc.setFont('helvetica', 'bold');
-    doc.setFontSize(9);
-    doc.setTextColor(15, 23, 42);
-    doc.text(`Factory Outlook & Exterior Photos (${outlookPhotos.length}):`, margin, y);
-    y += 4;
-
-    const photoWidth = 36;
-    const photoHeight = 24;
-    const photoSpacing = 4;
-    const photosPerRow = 4;
-
-    outlookPhotos.forEach((photo, idx) => {
-      const col = idx % photosPerRow;
-      const row = Math.floor(idx / photosPerRow);
-      if (col === 0 && row > 0) {
-        checkPageBreak(photoHeight + 6);
-      }
-      const pX = margin + col * (photoWidth + photoSpacing);
-      const pY = y + row * (photoHeight + 5);
-
-      try {
-        doc.addImage(photo.dataUrl, 'JPEG', pX, pY, photoWidth, photoHeight, undefined, 'FAST');
-        doc.setFontSize(6);
-        doc.setTextColor(100, 116, 139);
-        doc.text(`Outlook #${idx + 1}`, pX + 1, pY + photoHeight + 3);
-      } catch (e) {
-        console.warn(`Failed embedding factory outlook photo ${idx + 1}`, e);
-      }
-    });
-
-    const totalRows = Math.ceil(outlookPhotos.length / photosPerRow);
-    y += totalRows * (photoHeight + 5) + 3;
-  }
-
-  // --- FACTORY CERTIFICATIONS & FACILITIES ---
-  checkPageBreak(30);
-  doc.setFont('helvetica', 'bold');
-  doc.setFontSize(9);
-  doc.setTextColor(15, 23, 42);
-  doc.text('Factory Facilities & Certifications:', margin, y);
-  y += 4;
-
-  const activeFacilities = report.factoryInfo.facilities || [];
-  doc.setFont('helvetica', 'normal');
-  doc.setFontSize(8);
-  doc.setTextColor(51, 65, 85);
-  const facilityStr = activeFacilities.length > 0 ? activeFacilities.join('  •  ') : 'All departments assessed';
-  const splitFacilities = doc.splitTextToSize(`Facilities: ${facilityStr}`, contentWidth);
-  doc.text(splitFacilities, margin, y);
-  y += splitFacilities.length * 4 + 2;
-
-  const activeCerts = (report.factoryInfo.certifications || []).filter((c) => c.selected);
-  if (activeCerts.length > 0) {
-    const certStr = activeCerts.map((c) => c.name).join('  |  ');
-    const splitCerts = doc.splitTextToSize(`Certifications: ${certStr}`, contentWidth);
-    doc.text(splitCerts, margin, y);
-    y += splitCerts.length * 4 + 3;
-
-    const certsWithPhoto = activeCerts.filter((c) => c.photo);
-    if (certsWithPhoto.length > 0) {
-      checkPageBreak(36);
-      doc.setFont('helvetica', 'bold');
-      doc.setFontSize(8);
-      doc.setTextColor(100, 116, 139);
-      doc.text(`Certification Documents Photo Evidence (${certsWithPhoto.length}):`, margin, y);
-      y += 3.5;
-
-      const cPhotoWidth = 36;
-      const cPhotoHeight = 24;
-      const cPhotoSpacing = 4;
-      const cPhotosPerRow = 4;
-
-      certsWithPhoto.forEach((c, idx) => {
-        const col = idx % cPhotosPerRow;
-        const row = Math.floor(idx / cPhotosPerRow);
-        if (col === 0 && row > 0) {
-          checkPageBreak(cPhotoHeight + 6);
-        }
-        const pX = margin + col * (cPhotoWidth + cPhotoSpacing);
-        const pY = y + row * (cPhotoHeight + 5);
-
-        try {
-          if (c.photo) {
-            doc.addImage(c.photo, 'JPEG', pX, pY, cPhotoWidth, cPhotoHeight);
-            doc.setFontSize(6);
-            doc.setTextColor(100, 116, 139);
-            const shortName = c.name.length > 20 ? c.name.substring(0, 18) + '...' : c.name;
-            doc.text(shortName, pX + 1, pY + cPhotoHeight + 3);
-          }
-        } catch (e) {
-          console.warn(`Failed embedding certification photo for ${c.name}`, e);
-        }
-      });
-
-      const totalCRows = Math.ceil(certsWithPhoto.length / cPhotosPerRow);
-      y += totalCRows * (cPhotoHeight + 5) + 3;
-    }
-  } else {
-    y += 2;
-  }
-
-  // --- SECTION BREAKDOWN TABLE ---
-  checkPageBreak(50);
-  doc.setFont('helvetica', 'bold');
-  doc.setFontSize(10.5);
-  doc.setTextColor(15, 23, 42);
-  doc.text('2. SUMMARY', margin, y);
-  y += 5;
-
-  // Table Header
-  doc.setFillColor(241, 245, 249);
-  doc.rect(margin, y, contentWidth, 7, 'F');
-  doc.setFont('helvetica', 'bold');
-  doc.setFontSize(8);
-  doc.setTextColor(51, 65, 85);
-  doc.text('Department / Section', margin + 3, y + 4.8);
-  doc.text('Points', margin + 68, y + 4.8);
-  doc.text('Max', margin + 86, y + 4.8);
-  doc.text('Score %', margin + 104, y + 4.8);
-  doc.text('Critical', margin + 125, y + 4.8);
-  doc.text('Major', margin + 142, y + 4.8);
-  doc.text('Minor', margin + 158, y + 4.8);
-  doc.text('Trend', margin + 175, y + 4.8);
-
-  y += 8;
-
-  report.sectionSummaries.forEach((s) => {
-    checkPageBreak(8);
-    doc.setFont('helvetica', 'normal');
-    doc.setFontSize(8);
-    doc.setTextColor(15, 23, 42);
-
-    doc.text(s.sectionName, margin + 3, y + 4);
-    doc.text(`${s.earnedPoints}`, margin + 68, y + 4);
-    doc.text(`${s.maxPoints}`, margin + 86, y + 4);
-
-    // Color code per requested rule
-    if (s.percentage >= 80) {
-      doc.setTextColor(21, 128, 61); // deep green
-    } else if (s.percentage >= 60) {
-      doc.setTextColor(217, 119, 6); // amber
-    } else {
-      doc.setTextColor(220, 38, 38); // red
-    }
+    doc.text(l1, margin + 2, y + 3.8);
+    doc.text(l2, margin + c1 + c2 + 2, y + 3.8);
 
     doc.setFont('helvetica', 'bold');
-    doc.text(`${s.percentage}%`, margin + 104, y + 4);
+    doc.setTextColor(15, 23, 42);
+    doc.text(v1Lines, margin + c1 + 2, y + 3.8);
+    doc.text(v2Lines, margin + c1 + c2 + c3 + 2, y + 3.8);
 
-    doc.setFont('helvetica', 'normal');
-    doc.setTextColor(s.criticalCount > 0 ? 220 : 100, s.criticalCount > 0 ? 38 : 116, s.criticalCount > 0 ? 38 : 139);
-    doc.text(`${s.criticalCount}`, margin + 128, y + 4);
-
-    doc.setTextColor(s.majorCount > 0 ? 202 : 100, s.majorCount > 0 ? 138 : 116, s.majorCount > 0 ? 4 : 139);
-    doc.text(`${s.majorCount}`, margin + 145, y + 4);
-
-    doc.setTextColor(s.minorCount > 0 ? 217 : 100, s.minorCount > 0 ? 119 : 116, s.minorCount > 0 ? 6 : 139);
-    doc.text(`${s.minorCount}`, margin + 161, y + 4);
-
-    // Visual color trend bar (-----) without text like "amber mark"
-    if (s.percentage >= 80) {
-      doc.setFillColor(21, 128, 61); // deep green
-    } else if (s.percentage >= 60) {
-      doc.setFillColor(217, 119, 6); // amber
-    } else {
-      doc.setFillColor(220, 38, 38); // red
-    }
-    doc.roundedRect(margin + 175, y + 2, 16, 2.5, 1, 1, 'F');
-
-    // Underline
-    doc.setDrawColor(241, 245, 249);
-    doc.line(margin, y + 6, margin + contentWidth, y + 6);
-    y += 7;
+    y += rowH;
   });
 
   y += 5;
 
-  // --- EXECUTIVE SUMMARY ---
-  if (report.executiveSummary) {
-    checkPageBreak(28);
-    doc.setFont('helvetica', 'bold');
-    doc.setFontSize(9.5);
-    doc.setTextColor(15, 23, 42);
-    doc.text('Executive Summary & Observations:', margin, y);
-    y += 4;
+  // --- 3. AUDITOR COMMENT & RIGHT-ALIGNED STATUS BAR ---
+  const commentText =
+    report.executiveSummary ||
+    `Internal Technical Audit conducted at ${factoryName} on ${auditDate}. Overall score achieved: ${report.overallPercentage}%.`;
+  const splitComment = doc.splitTextToSize(commentText, contentWidth);
+  checkPageBreak(splitComment.length * 3.8 + 16);
 
-    doc.setFillColor(248, 250, 252);
-    doc.setDrawColor(226, 232, 240);
-    const splitSummary = doc.splitTextToSize(report.executiveSummary, contentWidth - 8);
-    const summaryHeight = splitSummary.length * 4.5 + 8;
-    doc.roundedRect(margin, y, contentWidth, summaryHeight, 2, 2, 'FD');
-
-    doc.setFont('helvetica', 'normal');
-    doc.setFontSize(8.5);
-    doc.setTextColor(51, 65, 85);
-    doc.text(splitSummary, margin + 4, y + 5);
-    y += summaryHeight + 6;
-  }
-
-  // --- DETAILED NON-CONFORMANCES & MULTIPLE PHOTO EVIDENCE SECTION ---
-  checkPageBreak(40);
   doc.setFont('helvetica', 'bold');
-  doc.setFontSize(10.5);
+  doc.setFontSize(8);
   doc.setTextColor(15, 23, 42);
-  doc.text('3. NON-CONFORMANCE LOG & MULTI-PHOTO EVIDENCE', margin, y);
+  doc.text('Auditor Comment:', margin, y);
+  y += 4;
+
+  doc.setFont('helvetica', 'normal');
+  doc.setFontSize(7.8);
+  doc.setTextColor(30, 41, 59);
+  doc.text(splitComment, margin, y);
+  y += splitComment.length * 3.7 + 3;
+
+  // Status Bar Row
+  const barW = 86;
+  const barX = margin + contentWidth - barW;
+  const barH = 5.5;
+  doc.setFont('helvetica', 'bold');
+  doc.setFontSize(7.5);
+  doc.setTextColor(15, 23, 42);
+  doc.text('Status', barX - 11, y + 3.8);
+
+  const statusRgb: [number, number, number] =
+    scoreBand.band === 'deep-green'
+      ? [77, 155, 88]
+      : scoreBand.band === 'amber'
+      ? [217, 119, 6]
+      : [220, 38, 38];
+  const statusLabel =
+    scoreBand.band === 'deep-green'
+      ? 'Compliant (Deep Green)'
+      : scoreBand.band === 'amber'
+      ? 'Conditional Pass (Amber)'
+      : 'Action Required (Red)';
+
+  doc.setFillColor(statusRgb[0], statusRgb[1], statusRgb[2]);
+  doc.rect(barX, y, barW, barH, 'F');
+  doc.setTextColor(255, 255, 255);
+  doc.setFontSize(7.5);
+  doc.text(statusLabel, barX + barW / 2, y + 3.8, { align: 'center' });
+  y += 10;
+
+  // --- 4. SUMMARY TABLE ---
+  checkPageBreak(30);
+  doc.setFont('helvetica', 'bold');
+  doc.setFontSize(9.5);
+  doc.setTextColor(15, 23, 42);
+  doc.text('SUMMARY:', margin, y);
+  y += 4;
+
+  const leftColW = contentWidth * 0.68;
+  const rightColW = contentWidth - leftColW;
+
+  doc.setDrawColor(100, 116, 139);
+  doc.setLineWidth(0.2);
+
+  // Spacer Header Row
+  doc.setFillColor(248, 250, 252);
+  doc.rect(margin, y, leftColW, 4, 'FD');
+  doc.rect(margin + leftColW, y, rightColW, 4, 'FD');
+  y += 4;
+
+  // Row 1: 1 FACTORY BASIC INFORMATION
+  doc.setFillColor(255, 255, 255);
+  doc.rect(margin, y, leftColW, 6, 'FD');
+  doc.rect(margin + leftColW, y, rightColW, 6, 'FD');
+  doc.setFont('helvetica', 'bold');
+  doc.setFontSize(7.5);
+  doc.setTextColor(15, 23, 42);
+  doc.text('1  FACTORY BASIC INFORMATION', margin + 2, y + 4);
+  drawSegmentedBar(doc, margin + leftColW + rightColW / 2 - 9, y + 1.5, 18, 3, {
+    critical: 0,
+    major: 0,
+    minor: 0,
+    none: report.factoryInfo.name ? 2 : 1,
+    na: report.factoryInfo.openingMeetingPhoto ? 0 : 1,
+  });
   y += 6;
 
-  let nonConformanceCount = 0;
+  // Section summary rows + Critical (!) callout sub-rows
+  report.sections.forEach((sec, idx) => {
+    const sum: SectionScoreSummary = report.sectionSummaries[idx];
+    const rowH = 6;
+    checkPageBreak(rowH + 6);
 
-  for (const section of report.sections) {
-    const issues = section.checkpoints.filter(
-      (cp) =>
-        cp.score === 'critical' ||
-        cp.score === 'major' ||
-        cp.score === 'minor' ||
-        (cp.images && cp.images.length > 0) ||
-        (cp.notes && cp.notes.trim().length > 0)
-    );
+    doc.setFillColor(255, 255, 255);
+    doc.rect(margin, y, leftColW, rowH, 'FD');
+    doc.rect(margin + leftColW, y, rightColW, rowH, 'FD');
 
-    if (issues.length === 0) continue;
-
-    checkPageBreak(18);
     doc.setFont('helvetica', 'bold');
-    doc.setFontSize(9);
-    doc.setTextColor(30, 41, 59);
-    doc.setFillColor(241, 245, 249);
-    doc.roundedRect(margin, y, contentWidth, 6, 1, 1, 'F');
-    doc.text(`${section.name} (${section.code})`, margin + 3, y + 4.2);
+    doc.setFontSize(7.5);
+    doc.setTextColor(15, 23, 42);
+    const secLabel = `${idx + 2}  ${idx + 1}. ${sec.name.toUpperCase()}`;
+    doc.text(secLabel.slice(0, 68), margin + 2, y + 4);
+
+    // Score % + Segmented bar
+    const barBoxX = margin + leftColW + rightColW / 2 - 4;
+    if (sum.evaluatedCount > 0) {
+      doc.setFont('helvetica', 'bold');
+      doc.setFontSize(7.5);
+      doc.setTextColor(15, 23, 42);
+      doc.text(`${sum.percentage.toFixed(1)}%`, barBoxX - 2, y + 4, { align: 'right' });
+    }
+    drawSegmentedBar(doc, barBoxX, y + 1.6, 18, 2.8, {
+      critical: sum.criticalCount,
+      major: sum.majorCount,
+      minor: sum.minorCount,
+      none: sum.noIssueCount,
+      na: sum.naCount,
+    });
+
+    y += rowH;
+
+    // Critical (!) highlights inside Summary table
+    const criticalCps = sec.checkpoints.filter((cp) => cp.score === 'critical');
+    criticalCps.forEach((cp) => {
+      const critText = `${idx + 2}.${sec.checkpoints.indexOf(cp) + 1}  ${cp.code} ${cp.title}`;
+      const critLines = doc.splitTextToSize(critText, leftColW - 12);
+      const critH = Math.max(6, critLines.length * 3.5 + 2.5);
+      checkPageBreak(critH + 4);
+
+      doc.setFillColor(255, 255, 255);
+      doc.rect(margin, y, leftColW, critH, 'FD');
+      doc.rect(margin + leftColW, y, rightColW, critH, 'FD');
+
+      doc.setFont('helvetica', 'bold');
+      doc.setFontSize(7);
+      doc.setTextColor(30, 41, 59);
+      doc.text(critLines, margin + 8, y + 4);
+
+      // Red (!) circle icon in right column
+      const cx = margin + leftColW + rightColW / 2;
+      const cy = y + critH / 2;
+      doc.setDrawColor(220, 38, 38);
+      doc.setLineWidth(0.35);
+      doc.circle(cx, cy, 2, 'S');
+      doc.setFont('helvetica', 'bold');
+      doc.setFontSize(7);
+      doc.setTextColor(220, 38, 38);
+      doc.text('!', cx, cy + 1, { align: 'center' });
+      doc.setDrawColor(100, 116, 139);
+      doc.setLineWidth(0.2);
+
+      y += critH;
+    });
+  });
+
+  // Bottom Summary Score Row
+  checkPageBreak(7);
+  doc.setFillColor(248, 250, 252);
+  doc.rect(margin, y, leftColW, 6.5, 'FD');
+  doc.rect(margin + leftColW, y, rightColW, 6.5, 'FD');
+  doc.setFont('helvetica', 'bold');
+  doc.setFontSize(8);
+  doc.setTextColor(15, 23, 42);
+  doc.text('Summary Score', margin + 2, y + 4.4);
+  doc.text(`${report.overallPercentage.toFixed(1)}%`, margin + leftColW + rightColW / 2, y + 4.4, {
+    align: 'center',
+  });
+  y += 11;
+
+  // --- 5. CHECKPOINTS DETAIL SECTION ---
+  const totalCheckpointsCount = report.sections.reduce((acc, s) => acc + s.checkpoints.length, 0);
+  checkPageBreak(22);
+  doc.setFont('helvetica', 'bold');
+  doc.setFontSize(9.5);
+  doc.setTextColor(15, 23, 42);
+  doc.text(`CHECKPOINTS: ${totalCheckpointsCount}`, margin, y);
+  y += 4;
+
+  // Section 1: FACTORY BASIC INFORMATION
+  doc.setDrawColor(100, 116, 139);
+  doc.setLineWidth(0.2);
+  doc.setFillColor(248, 250, 252);
+  doc.rect(margin, y, 12, 6.5, 'FD');
+  doc.rect(margin + 12, y, leftColW - 12, 6.5, 'FD');
+  doc.rect(margin + leftColW, y, rightColW, 6.5, 'FD');
+  doc.setFont('helvetica', 'bold');
+  doc.setFontSize(8);
+  doc.setTextColor(15, 23, 42);
+  doc.text('1', margin + 6, y + 4.4, { align: 'center' });
+  doc.text('FACTORY BASIC INFORMATION', margin + 14.5, y + 4.4);
+  drawSegmentedBar(doc, margin + leftColW + rightColW / 2 - 9, y + 1.8, 18, 3, {
+    critical: 0,
+    major: 0,
+    minor: 0,
+    none: 2,
+    na: 0,
+  });
+  y += 8.5;
+
+  // 1.1 Factory basic information header
+  checkPageBreak(14);
+  doc.setFillColor(255, 255, 255);
+  doc.rect(margin, y, 12, 6, 'FD');
+  doc.rect(margin + 12, y, contentWidth - 12, 6, 'FD');
+  doc.setFont('helvetica', 'bold');
+  doc.setFontSize(7.5);
+  doc.setTextColor(15, 23, 42);
+  doc.text('1.1', margin + 6, y + 4, { align: 'center' });
+  doc.text('Factory basic information', margin + 14.5, y + 4);
+  y += 8.5;
+
+  // Collect all Basic Information photos (Outlook + Opening Meeting + Certificates)
+  const basicPhotos: Array<{ dataUrl: string; label?: string }> = [];
+  (report.factoryInfo.factoryOutlookPhotos || []).forEach((p, i) => {
+    basicPhotos.push({ dataUrl: p.dataUrl, label: p.caption || `Outlook #${i + 1}` });
+  });
+  if (report.factoryInfo.openingMeetingPhoto) {
+    basicPhotos.push({
+      dataUrl: report.factoryInfo.openingMeetingPhoto,
+      label: 'Opening Meeting',
+    });
+  }
+  (report.factoryInfo.certifications || [])
+    .filter((c) => c.selected && c.photo)
+    .forEach((c) => {
+      if (c.photo) basicPhotos.push({ dataUrl: c.photo, label: c.name });
+    });
+
+  if (basicPhotos.length > 0) {
+    y = drawPhotoGrid4Col(doc, basicPhotos, margin, contentWidth, y, checkPageBreak);
+    y += 2;
+  }
+
+  // Production Unit Custom Field | Value table
+  const fieldColW = 54;
+  const valColW = contentWidth - fieldColW;
+  const activeFacilities = report.factoryInfo.facilities || [];
+  const activeCerts = (report.factoryInfo.certifications || []).filter((c) => c.selected).map((c) => c.name);
+  const activeBrands = (report.factoryInfo.buyerBrand || '')
+    .split(/[,;|]+/)
+    .map((b) => b.trim())
+    .filter(Boolean);
+
+  checkPageBreak(14);
+  doc.setFillColor(248, 250, 252);
+  doc.rect(margin, y, fieldColW, 6, 'FD');
+  doc.rect(margin + fieldColW, y, valColW, 6, 'FD');
+  doc.setFont('helvetica', 'bold');
+  doc.setFontSize(7.5);
+  doc.setTextColor(15, 23, 42);
+  doc.text('Production Unit Custom Field', margin + 2, y + 4);
+  doc.text('Value', margin + fieldColW + 2, y + 4);
+  y += 6;
+
+  type CustomFieldRow =
+    | { label: string; kind: 'text'; value: string }
+    | { label: string; kind: 'pills'; items: string[] };
+
+  const customRows: CustomFieldRow[] = [
+    { label: 'Factory Address', kind: 'text', value: report.factoryInfo.address || 'N/A' },
+    {
+      label: 'Factory Facilities',
+      kind: 'pills',
+      items: activeFacilities.length > 0 ? activeFacilities : ['Standard Garment Facility'],
+    },
+    { label: 'Number of Workers', kind: 'text', value: report.factoryInfo.numberOfWorkers || 'N/A' },
+    { label: 'Number of Lines', kind: 'text', value: report.factoryInfo.numberOfLines || 'N/A' },
+    { label: 'Capacity (pcs per month)', kind: 'text', value: report.factoryInfo.capacityPerMonth || 'N/A' },
+    { label: 'Contact Person', kind: 'text', value: report.factoryInfo.contactPerson || 'N/A' },
+    { label: 'Contact Phone', kind: 'text', value: report.factoryInfo.contactPhone || 'N/A' },
+    { label: 'Contact Emails', kind: 'text', value: contactEmailsStr },
+    {
+      label: 'Certifications',
+      kind: 'pills',
+      items: activeCerts.length > 0 ? activeCerts : ['None Specified'],
+    },
+    {
+      label: 'Active Brands / Buyers',
+      kind: 'pills',
+      items: activeBrands.length > 0 ? activeBrands : ['General Export'],
+    },
+  ];
+
+  customRows.forEach((row) => {
+    if (row.kind === 'text') {
+      doc.setFont('helvetica', 'bold');
+      doc.setFontSize(7.5);
+      const lines = doc.splitTextToSize(row.value, valColW - 4);
+      const h = Math.max(5.8, lines.length * 3.5 + 2.3);
+      checkPageBreak(h + 2);
+
+      doc.setFillColor(255, 255, 255);
+      doc.rect(margin, y, fieldColW, h, 'FD');
+      doc.rect(margin + fieldColW, y, valColW, h, 'FD');
+      doc.setTextColor(15, 23, 42);
+      doc.text(row.label, margin + 2, y + 3.9);
+      doc.setFont('helvetica', 'normal');
+      doc.text(lines, margin + fieldColW + 2, y + 3.9);
+      y += h;
+    } else {
+      // Measure pills height first by computing lines
+      doc.setFont('helvetica', 'bold');
+      doc.setFontSize(6.5);
+      let cx = 0;
+      let rowsCount = 1;
+      row.items.forEach((raw) => {
+        const w = Math.min(doc.getTextWidth(String(raw).trim()) + 4, valColW - 5);
+        if (cx + w > valColW - 5 && cx > 0) {
+          cx = 0;
+          rowsCount++;
+        }
+        cx += w + 1.5;
+      });
+      const h = Math.max(6.2, rowsCount * 5.7 + 2);
+      checkPageBreak(h + 2);
+
+      doc.setFillColor(255, 255, 255);
+      doc.rect(margin, y, fieldColW, h, 'FD');
+      doc.rect(margin + fieldColW, y, valColW, h, 'FD');
+      doc.setFont('helvetica', 'bold');
+      doc.setFontSize(7.5);
+      doc.setTextColor(15, 23, 42);
+      doc.text(row.label, margin + 2, y + 4);
+      drawWrappedPillBadges(doc, row.items, margin + fieldColW + 2, y + 1.2, valColW - 4);
+      y += h;
+    }
+  });
+
+  y += 4;
+
+  // 1.2 Opening Meeting Notes (if provided)
+  if (report.factoryInfo.openingMeetingNotes?.trim()) {
+    checkPageBreak(18);
+    doc.setFillColor(255, 255, 255);
+    doc.rect(margin, y, 12, 6, 'FD');
+    doc.rect(margin + 12, y, contentWidth - 30, 6, 'FD');
+    doc.rect(margin + contentWidth - 18, y, 18, 6, 'FD');
+    doc.setFont('helvetica', 'bold');
+    doc.setFontSize(7.5);
+    doc.setTextColor(15, 23, 42);
+    doc.text('1.2', margin + 6, y + 4, { align: 'center' });
+    doc.text('Opening Meeting Notes & Attendees', margin + 14.5, y + 4);
+    doc.text('OK', margin + contentWidth - 9, y + 4, { align: 'center' });
+    y += 8;
+
+    doc.setFont('helvetica', 'normal');
+    doc.setFontSize(7.5);
+    doc.setTextColor(51, 65, 85);
+    const notesLines = doc.splitTextToSize(report.factoryInfo.openingMeetingNotes, contentWidth - 16);
+    doc.text(notesLines, margin + 14.5, y);
+    y += notesLines.length * 3.8 + 4;
+  }
+
+  // --- 6. EACH AUDITED SECTION & CHECKPOINTS ---
+  report.sections.forEach((sec, secIdx) => {
+    const sum = report.sectionSummaries[secIdx];
+    const itemsToRender = sec.checkpoints.filter(
+      (cp) => cp.score !== null || (cp.notes && cp.notes.trim().length > 0) || (cp.images && cp.images.length > 0)
+    );
+    if (itemsToRender.length === 0) return;
+
+    checkPageBreak(22);
+
+    // Section Header Box
+    doc.setDrawColor(100, 116, 139);
+    doc.setLineWidth(0.2);
+    doc.setFillColor(248, 250, 252);
+    doc.rect(margin, y, 12, 6.5, 'FD');
+    doc.rect(margin + 12, y, leftColW - 12, 6.5, 'FD');
+    doc.rect(margin + leftColW, y, rightColW, 6.5, 'FD');
+
+    doc.setFont('helvetica', 'bold');
+    doc.setFontSize(8);
+    doc.setTextColor(15, 23, 42);
+    doc.text(`${secIdx + 2}`, margin + 6, y + 4.4, { align: 'center' });
+    doc.text(`${secIdx + 1}. ${sec.name.toUpperCase()}`, margin + 14.5, y + 4.4);
+
+    const barXPos = margin + leftColW + rightColW / 2 - 4;
+    if (sum.evaluatedCount > 0) {
+      doc.text(`${sum.percentage.toFixed(1)}%`, barXPos - 2, y + 4.4, { align: 'right' });
+    }
+    drawSegmentedBar(doc, barXPos, y + 1.8, 18, 3, {
+      critical: sum.criticalCount,
+      major: sum.majorCount,
+      minor: sum.minorCount,
+      none: sum.noIssueCount,
+      na: sum.naCount,
+    });
     y += 9;
 
-    for (const cp of issues) {
-      nonConformanceCount++;
-      const scoreMeta = cp.score ? SCORE_DEFINITIONS[cp.score] : null;
-      const imagesCount = cp.images?.length || 0;
+    // Render each checkpoint in this section
+    itemsToRender.forEach((cp) => {
+      const cpNum = sec.checkpoints.indexOf(cp) + 1;
+      const meta = cp.score ? SCORE_DEFINITIONS[cp.score] : null;
+      const titleColW = contentWidth - 12 - 36;
 
-      // Calculate dynamic height based on number of attached photos
-      // Images rendered in rows of up to 3 photos each
-      const imageRows = Math.ceil(imagesCount / 3);
-      const photoRowHeight = 32;
-      const photosTotalHeight = imageRows > 0 ? imageRows * photoRowHeight + 4 : 0;
-      const neededHeight = Math.max(22, 18 + photosTotalHeight);
-
-      checkPageBreak(neededHeight + 4);
-
-      // Card box
-      doc.setFillColor(255, 255, 255);
-      doc.setDrawColor(226, 232, 240);
-      doc.roundedRect(margin, y, contentWidth, neededHeight, 1.5, 1.5, 'FD');
-
-      // Checkpoint Code & Title
       doc.setFont('helvetica', 'bold');
-      doc.setFontSize(8.5);
-      doc.setTextColor(15, 23, 42);
-      doc.text(`[${cp.code}] ${cp.title}`, margin + 3, y + 5);
-
-      // Score Pill
-      if (scoreMeta) {
-        if (cp.score === 'critical') doc.setFillColor(239, 68, 68);
-        else if (cp.score === 'major') doc.setFillColor(234, 179, 8);
-        else if (cp.score === 'minor') doc.setFillColor(217, 119, 6);
-        else doc.setFillColor(21, 128, 61);
-
-        doc.rect(margin + contentWidth - 40, y + 2, 38, 4.5, 'F');
-        doc.setFont('helvetica', 'bold');
-        doc.setFontSize(7.5);
-        doc.setTextColor(cp.score === 'major' ? 15 : 255, cp.score === 'major' ? 23 : 255, cp.score === 'major' ? 42 : 255);
-        doc.text(`${scoreMeta.label} (${scoreMeta.points} pts)`, margin + contentWidth - 38, y + 5.2);
-      }
-
-      // Checkpoint Notes & Observation
-      doc.setFont('helvetica', 'normal');
       doc.setFontSize(7.5);
-      doc.setTextColor(71, 85, 105);
-      const notesText = cp.notes ? `Observation: ${cp.notes}` : `Requirement: ${cp.description}`;
-      const splitNotes = doc.splitTextToSize(notesText, contentWidth - 8);
-      doc.text(splitNotes, margin + 3, y + 10);
+      const cpTitleLines = doc.splitTextToSize(`${cp.code}  ${cp.title}`, titleColW - 4);
+      const headerH = Math.max(6.2, cpTitleLines.length * 3.6 + 2.5);
 
-      // Render ALL multiple photos in a clean grid
-      if (imagesCount > 0) {
-        let currentPhotoY = y + 14 + (splitNotes.length > 1 ? 4 : 0);
-        const photoWidth = 42;
-        const photoHeight = 28;
-        const photoSpacing = 4;
+      const noteBody = cp.notes?.trim()
+        ? cp.notes.trim()
+        : cp.description || 'Evaluated per technical audit criteria.';
+      const bulletLines = doc.splitTextToSize(`o  ${noteBody}`, contentWidth - 18);
+      const bulletH = bulletLines.length * 3.6 + 2;
 
-        cp.images.forEach((img, imgIdx) => {
-          const col = imgIdx % 3;
-          const row = Math.floor(imgIdx / 3);
-          const imgX = margin + 3 + col * (photoWidth + photoSpacing);
-          const imgY = currentPhotoY + row * (photoHeight + 4);
+      checkPageBreak(headerH + bulletH + (cp.images?.length ? 34 : 4));
 
-          try {
-            doc.addImage(img.dataUrl, 'JPEG', imgX, imgY, photoWidth, photoHeight, undefined, 'FAST');
-            doc.setFontSize(6);
-            doc.setTextColor(148, 163, 184);
-            doc.text(`Photo ${imgIdx + 1}`, imgX + 1, imgY + photoHeight + 3);
-          } catch (e) {
-            console.warn(`Failed embedding photo ${imgIdx + 1}`, e);
-          }
-        });
+      // Checkpoint Header Box
+      doc.setDrawColor(100, 116, 139);
+      doc.setFillColor(255, 255, 255);
+      doc.rect(margin, y, 12, headerH, 'FD');
+      doc.rect(margin + 12, y, titleColW, headerH, 'FD');
+      doc.rect(margin + 12 + titleColW, y, 36, headerH, 'FD');
+
+      doc.setFont('helvetica', 'bold');
+      doc.setFontSize(7.5);
+      doc.setTextColor(15, 23, 42);
+      doc.text(`${secIdx + 2}.${cpNum}`, margin + 6, y + 4.1, { align: 'center' });
+      doc.text(cpTitleLines, margin + 14.5, y + 4.1);
+
+      // Right status/score badge
+      if (meta) {
+        const badgeColor: [number, number, number] =
+          cp.score === 'critical'
+            ? [220, 38, 38]
+            : cp.score === 'major'
+            ? [245, 158, 11]
+            : cp.score === 'minor'
+            ? [59, 130, 246]
+            : cp.score === 'none'
+            ? [77, 155, 88]
+            : [148, 163, 184];
+
+        const pillX = margin + 12 + titleColW + 2;
+        doc.setFillColor(badgeColor[0], badgeColor[1], badgeColor[2]);
+        doc.roundedRect(pillX, y + 1.4, 32, headerH - 2.8, 0.8, 0.8, 'F');
+        doc.setFont('helvetica', 'bold');
+        doc.setFontSize(6.5);
+        doc.setTextColor(cp.score === 'major' ? 15 : 255, cp.score === 'major' ? 23 : 255, cp.score === 'major' ? 42 : 255);
+        const ptsText = cp.score === 'na' ? 'N/A' : `${meta.label} (${meta.points})`;
+        doc.text(ptsText, pillX + 16, y + headerH / 2 + 1, { align: 'center' });
+      }
+      y += headerH + 2.5;
+
+      // Bullet finding line(s)
+      doc.setFont('helvetica', 'normal');
+      doc.setFontSize(7.3);
+      doc.setTextColor(30, 41, 59);
+      doc.text(bulletLines, margin + 14.5, y + 2);
+      y += bulletH + 1;
+
+      // Checkpoint photos in 4-col grid
+      if (cp.images && cp.images.length > 0) {
+        const cpPhotos = cp.images.map((img, i) => ({
+          dataUrl: img.dataUrl,
+          label: img.caption || `${cp.code} #${i + 1}`,
+        }));
+        y = drawPhotoGrid4Col(doc, cpPhotos, margin, contentWidth, y, checkPageBreak);
       }
 
-      y += neededHeight + 3;
-    }
-  }
+      y += 2;
+    });
+  });
 
-  if (nonConformanceCount === 0) {
-    doc.setFont('helvetica', 'normal');
-    doc.setFontSize(8.5);
-    doc.setTextColor(21, 128, 61);
-    doc.text('No non-conformances identified during this technical audit.', margin + 3, y + 4);
-    y += 10;
-  }
-
-  // --- OPTIONAL CAP (CUSTOM SECTION SELECTION OR LOW SCORES) ---
+  // --- 7. OPTIONAL CAP SUMMARY IN MAIN AUDIT PDF ---
   if (options?.includeCap) {
     const targetSections = report.sectionSummaries.filter((s) => {
       if (options.selectedCapSectionIds && options.selectedCapSectionIds.length > 0) {
@@ -553,61 +769,277 @@ export async function generateAuditPdf(
     });
 
     if (targetSections.length > 0) {
-      checkPageBreak(45);
-      y += 6;
+      checkPageBreak(30);
+      y += 4;
       doc.setFont('helvetica', 'bold');
       doc.setFontSize(9.5);
       doc.setTextColor(15, 23, 42);
-      doc.text('4. CORRECTIVE ACTION PLAN (CAP) PROTOCOL', margin, y);
-      y += 6;
+      doc.text('CORRECTIVE ACTION PLAN (CAP) PROTOCOL', margin, y);
+      y += 5;
 
       targetSections.forEach((sec) => {
-        checkPageBreak(26);
+        checkPageBreak(18);
+        doc.setDrawColor(220, 38, 38);
         doc.setFillColor(254, 242, 242);
-        doc.setDrawColor(252, 165, 165);
-        doc.roundedRect(margin, y, contentWidth, 20, 2, 2, 'FD');
-
+        doc.rect(margin, y, contentWidth, 14, 'FD');
         doc.setFont('helvetica', 'bold');
-        doc.setFontSize(8.5);
+        doc.setFontSize(8);
         doc.setTextColor(153, 27, 27);
-        doc.text(`${sec.sectionName} — Score: ${sec.percentage}% (${sec.criticalCount} Critical, ${sec.majorCount} Below Expectation)`, margin + 4, y + 6);
-
+        doc.text(
+          `${sec.sectionName} — Score: ${sec.percentage}% (${sec.criticalCount} Critical, ${sec.majorCount} Below Exp.)`,
+          margin + 3,
+          y + 5
+        );
         doc.setFont('helvetica', 'normal');
-        doc.setFontSize(7.5);
+        doc.setFontSize(7.2);
         doc.setTextColor(71, 85, 105);
-        doc.text('Action Required: Formal Root Cause Analysis (RCA) and preventive action plan submission within 14 working days.', margin + 4, y + 11);
-        doc.text('Verification: On-site follow-up audit required before buyer production approval.', margin + 4, y + 16);
-
-        y += 24;
+        doc.text(
+          'Required: Root Cause Analysis (RCA), Corrective Action, Responsible Owner & Verification Evidence.',
+          margin + 3,
+          y + 10.5
+        );
+        y += 17;
       });
     }
   }
 
-  // Apply clean Header & Footer across ALL pages
-  const totalPages = (doc as any).internal.getNumberOfPages();
-  const auditedFactoryName = report.factoryInfo.name || 'Factory';
-  for (let i = 1; i <= totalPages; i++) {
-    doc.setPage(i);
-    // Header bar
-    doc.setFillColor(15, 23, 42);
-    doc.rect(0, 0, pageWidth, 3, 'F');
+  applyPageFooters(doc, factoryName, auditDate, margin);
 
-    // Footer: Left = Audited Factory Name; Right = Auditor(s) + Page No
+  const sanitizedName = factoryName.replace(/[^a-zA-Z0-9_-]/g, '_');
+  const reportCode = reportNo.replace(/[^a-zA-Z0-9_-]/g, '_');
+  const fileName = `Internal_Technical_Audit_${sanitizedName}_${reportCode}.pdf`;
+
+  return { doc, fileName };
+}
+
+export async function generateAuditPdfBlob(
+  report: AuditReportData,
+  options?: GeneratePdfOptions
+): Promise<{ blob: Blob; fileName: string }> {
+  const { doc, fileName } = await buildAuditPdfDocument(report, options);
+  const blob = doc.output('blob');
+  return { blob, fileName };
+}
+
+export async function generateAuditPdf(
+  report: AuditReportData,
+  options?: GeneratePdfOptions
+): Promise<void> {
+  const { doc, fileName } = await buildAuditPdfDocument(report, options);
+  doc.save(fileName);
+}
+
+/**
+ * Generates a dedicated Qarma-style Corrective Action Plan (CAP) PDF Report
+ * including original findings, root cause, corrective actions, closure verification & after-fix photos.
+ */
+export async function generateCapPdf(report: AuditReportData, capItemsOverride?: CapItem[]): Promise<void> {
+  const doc = new jsPDF({
+    orientation: 'portrait',
+    unit: 'mm',
+    format: 'a4',
+  });
+
+  const pageWidth = doc.internal.pageSize.getWidth();
+  const pageHeight = doc.internal.pageSize.getHeight();
+  const margin = 12;
+  const contentWidth = pageWidth - margin * 2;
+  let y = margin;
+
+  const checkPageBreak = (neededHeight: number) => {
+    if (y + neededHeight > pageHeight - 16) {
+      doc.addPage();
+      y = margin;
+    }
+  };
+
+  const factoryName = report.factoryInfo.name || 'Factory';
+  const auditDate = report.factoryInfo.auditDate || new Date().toISOString().split('T')[0];
+  const reportNo = report.factoryInfo.auditReportNo || report.factoryInfo.factoryRegistrationNo || report.id || 'N/A';
+  const capList: CapItem[] = capItemsOverride || report.capItems || [];
+
+  const openCount = capList.filter((c) => c.status === 'open').length;
+  const inProgressCount = capList.filter((c) => c.status === 'in-progress').length;
+  const closedCount = capList.filter((c) => c.status === 'closed').length;
+  const closureRate = capList.length > 0 ? Math.round((closedCount / capList.length) * 100) : 100;
+
+  // Header
+  doc.setFont('helvetica', 'bold');
+  doc.setFontSize(9.5);
+  doc.setTextColor(29, 78, 216);
+  doc.text('Corrective Action Plan (CAP) Report', margin, y + 3);
+  y += 6.5;
+
+  doc.setFontSize(16);
+  doc.setTextColor(15, 23, 42);
+  doc.text(factoryName.toUpperCase(), margin, y + 4);
+  y += 9;
+
+  // Metadata Box
+  const c1 = 28;
+  const c2 = 65;
+  const c3 = 30;
+  const c4 = contentWidth - c1 - c2 - c3;
+  doc.setDrawColor(100, 116, 139);
+  doc.setLineWidth(0.2);
+
+  const metaRows: Array<[string, string, string, string]> = [
+    ['Audit Date', auditDate, 'Report No.', reportNo],
+    ['Audit Type', report.factoryInfo.auditType || 'Annual Audit', 'Auditor', report.factoryInfo.auditorName || 'Lead Auditor'],
+    ['CAP Updated', (report.capUpdatedAt || new Date().toISOString()).split('T')[0], 'Closure Rate', `${closedCount}/${capList.length} Closed (${closureRate}%)`],
+  ];
+
+  metaRows.forEach(([l1, v1, l2, v2]) => {
     doc.setFontSize(7.5);
-    doc.setFont('helvetica', 'bold');
-    doc.setTextColor(71, 85, 105);
-    doc.text(`Factory: ${auditedFactoryName}`, margin, pageHeight - 5);
+    doc.setFillColor(248, 250, 252);
+    doc.rect(margin, y, c1, 5.8, 'FD');
+    doc.setFillColor(255, 255, 255);
+    doc.rect(margin + c1, y, c2, 5.8, 'FD');
+    doc.setFillColor(248, 250, 252);
+    doc.rect(margin + c1 + c2, y, c3, 5.8, 'FD');
+    doc.setFillColor(255, 255, 255);
+    doc.rect(margin + c1 + c2 + c3, y, c4, 5.8, 'FD');
 
     doc.setFont('helvetica', 'normal');
     doc.setTextColor(100, 116, 139);
-    const footerAuditor = auditor2DisplayName
-      ? `Auditors: ${auditorDisplayName} & ${auditor2DisplayName}`
-      : `Auditor: ${auditorDisplayName}`;
-    doc.text(`${footerAuditor}  |  Page ${i} of ${totalPages}`, pageWidth - margin, pageHeight - 5, { align: 'right' });
+    doc.text(l1, margin + 2, y + 3.9);
+    doc.text(l2, margin + c1 + c2 + 2, y + 3.9);
+
+    doc.setFont('helvetica', 'bold');
+    doc.setTextColor(15, 23, 42);
+    doc.text(v1, margin + c1 + 2, y + 3.9);
+    doc.text(v2, margin + c1 + c2 + c3 + 2, y + 3.9);
+    y += 5.8;
+  });
+
+  y += 5;
+
+  // CAP Status Summary Cards Row
+  const boxW = (contentWidth - 9) / 4;
+  const statCards: Array<{ label: string; count: number; rgb: [number, number, number] }> = [
+    { label: 'Total CAP Items', count: capList.length, rgb: [30, 58, 138] },
+    { label: 'Open', count: openCount, rgb: [220, 38, 38] },
+    { label: 'In Progress', count: inProgressCount, rgb: [217, 119, 6] },
+    { label: 'Closed (Verified)', count: closedCount, rgb: [21, 128, 61] },
+  ];
+
+  statCards.forEach((card, idx) => {
+    const bx = margin + idx * (boxW + 3);
+    doc.setFillColor(248, 250, 252);
+    doc.setDrawColor(card.rgb[0], card.rgb[1], card.rgb[2]);
+    doc.setLineWidth(0.35);
+    doc.rect(bx, y, boxW, 13, 'FD');
+    doc.setFont('helvetica', 'bold');
+    doc.setFontSize(7);
+    doc.setTextColor(card.rgb[0], card.rgb[1], card.rgb[2]);
+    doc.text(card.label.toUpperCase(), bx + boxW / 2, y + 4.5, { align: 'center' });
+    doc.setFontSize(12);
+    doc.text(`${card.count}`, bx + boxW / 2, y + 10.5, { align: 'center' });
+  });
+  y += 18;
+
+  if (capList.length === 0) {
+    doc.setFont('helvetica', 'normal');
+    doc.setFontSize(9);
+    doc.setTextColor(21, 128, 61);
+    doc.text('No Corrective Action Plan (CAP) items found for this audit.', margin, y + 6);
+  } else {
+    capList.forEach((item, idx) => {
+      checkPageBreak(42);
+      const sevMeta = SCORE_DEFINITIONS[item.originalScore];
+      const statusColor: [number, number, number] =
+        item.status === 'closed'
+          ? [21, 128, 61]
+          : item.status === 'in-progress'
+          ? [217, 119, 6]
+          : [220, 38, 38];
+      const statusText =
+        item.status === 'closed' ? 'CLOSED (VERIFIED)' : item.status === 'in-progress' ? 'IN PROGRESS' : 'OPEN';
+
+      // Item Header Box
+      doc.setDrawColor(100, 116, 139);
+      doc.setLineWidth(0.2);
+      doc.setFillColor(248, 250, 252);
+      const titleColW = contentWidth - 12 - 38;
+      doc.setFont('helvetica', 'bold');
+      doc.setFontSize(7.5);
+      const titleLines = doc.splitTextToSize(`[${item.checkpointCode}] ${item.checkpointTitle}`, titleColW - 4);
+      const h = Math.max(7, titleLines.length * 3.6 + 2.5);
+
+      doc.rect(margin, y, 12, h, 'FD');
+      doc.rect(margin + 12, y, titleColW, h, 'FD');
+      doc.setFillColor(statusColor[0], statusColor[1], statusColor[2]);
+      doc.rect(margin + 12 + titleColW, y, 38, h, 'FD');
+
+      doc.setTextColor(15, 23, 42);
+      doc.text(`#${idx + 1}`, margin + 6, y + 4.3, { align: 'center' });
+      doc.text(titleLines, margin + 14, y + 4.3);
+
+      doc.setTextColor(255, 255, 255);
+      doc.setFontSize(6.8);
+      doc.text(statusText, margin + 12 + titleColW + 19, y + h / 2 + 1, { align: 'center' });
+      y += h;
+
+      // CAP Details Table
+      const detailRows: Array<[string, string]> = [
+        ['Section / Severity', `${item.sectionName}  •  ${sevMeta?.label || item.originalScore}`],
+        ['Original Finding', item.originalNotes || 'Non-compliance observed during audit'],
+        ['Root Cause', item.rootCause || 'Pending root cause analysis'],
+        ['Corrective Action', item.correctiveAction || 'Pending corrective action plan'],
+        [
+          'Owner & Target Date',
+          `Responsible: ${item.responsiblePerson || 'Not assigned'}   |   Target Date: ${item.targetDate || 'Not set'}`,
+        ],
+        [
+          'Closure Verification',
+          item.closureNotes || (item.status === 'closed' ? `Verified by ${item.verifiedBy || 'Auditor'}` : 'Pending verification'),
+        ],
+      ];
+
+      detailRows.forEach(([label, val]) => {
+        doc.setFont('helvetica', 'normal');
+        doc.setFontSize(7.3);
+        const vLines = doc.splitTextToSize(val, contentWidth - 42);
+        const rh = Math.max(5.5, vLines.length * 3.5 + 2.2);
+        checkPageBreak(rh + 2);
+
+        doc.setFillColor(255, 255, 255);
+        doc.rect(margin, y, 38, rh, 'FD');
+        doc.rect(margin + 38, y, contentWidth - 38, rh, 'FD');
+
+        doc.setFont('helvetica', 'bold');
+        doc.setTextColor(71, 85, 105);
+        doc.text(label, margin + 2, y + 3.8);
+
+        doc.setFont('helvetica', 'normal');
+        doc.setTextColor(15, 23, 42);
+        doc.text(vLines, margin + 40, y + 3.8);
+        y += rh;
+      });
+
+      y += 2;
+
+      // Original Issue Photos + Closure Evidence Photos
+      const beforePhotos = (item.originalImages || []).map((p: CheckpointEvidence, pIdx: number) => ({
+        dataUrl: p.dataUrl,
+        label: `Before Fix #${pIdx + 1}`,
+      }));
+      const afterPhotos = (item.closureImages || []).map((p: CheckpointEvidence, pIdx: number) => ({
+        dataUrl: p.dataUrl,
+        label: `After Fix (Closed) #${pIdx + 1}`,
+      }));
+      const allCapPhotos = [...beforePhotos, ...afterPhotos];
+      if (allCapPhotos.length > 0) {
+        y = drawPhotoGrid4Col(doc, allCapPhotos, margin, contentWidth, y, checkPageBreak);
+      }
+
+      y += 4;
+    });
   }
 
-  // Trigger download with clean filename
-  const sanitizedName = (report.factoryInfo.name || 'Factory').replace(/[^a-zA-Z0-9_-]/g, '_');
-  const reportCode = (report.factoryInfo.auditReportNo || report.id || 'Audit').replace(/[^a-zA-Z0-9_-]/g, '_');
-  doc.save(`Internal_Technical_Audit_${sanitizedName}_${reportCode}.pdf`);
+  applyPageFooters(doc, factoryName, auditDate, margin);
+
+  const sanitizedName = factoryName.replace(/[^a-zA-Z0-9_-]/g, '_');
+  const reportCode = reportNo.replace(/[^a-zA-Z0-9_-]/g, '_');
+  doc.save(`CAP_Report_${sanitizedName}_${reportCode}.pdf`);
 }

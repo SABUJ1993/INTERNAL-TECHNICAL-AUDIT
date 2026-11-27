@@ -5,7 +5,7 @@ import path from 'path';
 import { defineConfig, Plugin } from 'vite';
 import { VitePWA } from 'vite-plugin-pwa';
 
-const APP_VERSION = '2.8.0';
+const APP_VERSION = '2.9.0';
 const BUILD_TIME = Date.now();
 const RAW_BASE_PATH = process.env.VITE_BASE_PATH || '/';
 const BASE_PATH = RAW_BASE_PATH.endsWith('/') ? RAW_BASE_PATH : `${RAW_BASE_PATH}/`;
@@ -65,7 +65,7 @@ export default defineConfig(() => {
           name: 'Internal Technical Audit',
           short_name: 'TechAudit',
           description: 'Factory Technical & QMS Inspection Suite by Sabuj Mahmud',
-          theme_color: '#ffffff',
+          theme_color: '#1d4ed8',
           background_color: '#ffffff',
           display: 'standalone',
           start_url: BASE_PATH,

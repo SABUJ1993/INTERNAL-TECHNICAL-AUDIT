@@ -9,7 +9,7 @@ export interface UpdateInfo {
 }
 
 // Built-in bundle baseline version & timestamp
-const CURRENT_APP_VERSION = typeof __APP_VERSION__ !== 'undefined' ? __APP_VERSION__ : '2.8.0';
+const CURRENT_APP_VERSION = typeof __APP_VERSION__ !== 'undefined' ? __APP_VERSION__ : '2.9.0';
 const CURRENT_APP_BUILD_TIME =
   typeof __APP_BUILD_TIME__ !== 'undefined' ? Number(__APP_BUILD_TIME__) : 1793784180000;
 

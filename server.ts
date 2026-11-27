@@ -450,28 +450,37 @@ app.delete('/api/active-draft', (req, res) => {
   res.json({ success: true, message: 'Active draft reset successfully' });
 });
 
-// Audits CRUD - Strictly restricted to Admin: quality.bd.eng@gmail.com
+// Audits CRUD: Admin sees all; regular auditors only see their own auditorEmail audits (for CAP)
 const ADMIN_EMAIL = 'quality.bd.eng@gmail.com';
 
 app.get('/api/audits', (req, res) => {
-  const requester = (req.headers['x-auditor-email'] as string) || (req.query.email as string) || '';
-  if (requester.toLowerCase().trim() !== ADMIN_EMAIL.toLowerCase()) {
-    // Non-admins cannot view saved audit archives
+  const requester = ((req.headers['x-auditor-email'] as string) || (req.query.email as string) || '')
+    .toLowerCase()
+    .trim();
+  if (!requester) {
     return res.json([]);
   }
   const audits = loadAudits();
-  res.json(audits);
+  if (requester === ADMIN_EMAIL.toLowerCase()) {
+    return res.json(audits);
+  }
+  return res.json(
+    audits.filter((a) => a.auditorEmail && String(a.auditorEmail).toLowerCase().trim() === requester)
+  );
 });
 
 app.get('/api/audits/:id', (req, res) => {
-  const requester = (req.headers['x-auditor-email'] as string) || (req.query.email as string) || '';
-  if (requester.toLowerCase().trim() !== ADMIN_EMAIL.toLowerCase()) {
-    return res.status(403).json({ error: 'Permission denied: Only the Admin can access saved audits.' });
-  }
+  const requester = ((req.headers['x-auditor-email'] as string) || (req.query.email as string) || '')
+    .toLowerCase()
+    .trim();
   const audits = loadAudits();
   const audit = audits.find((a) => a.id === req.params.id);
   if (!audit) {
     return res.status(404).json({ error: 'Audit not found' });
+  }
+  const isOwner = audit.auditorEmail && String(audit.auditorEmail).toLowerCase().trim() === requester;
+  if (requester !== ADMIN_EMAIL.toLowerCase() && !isOwner) {
+    return res.status(403).json({ error: 'Permission denied: You can only access your own audits.' });
   }
   res.json(audit);
 });

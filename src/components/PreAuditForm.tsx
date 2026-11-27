@@ -42,6 +42,7 @@ interface Props {
   onOpenPreviewImage?: (evidence: CheckpointEvidence) => void;
   onOpenPhotoAction?: (evidence: CheckpointEvidence, sourceLocation: PhotoLocation) => void;
   onClearAllData?: () => void;
+  onStartNewAudit?: () => void;
 }
 
 const AUDIT_TYPE_OPTIONS: AuditType[] = [
@@ -60,17 +61,71 @@ export const PreAuditForm: React.FC<Props> = ({
   onOpenPreviewImage,
   onOpenPhotoAction,
   onClearAllData,
+  onStartNewAudit,
 }) => {
   const openingMeetingInputRef = useRef<HTMLInputElement>(null);
   const factoryOutlookInputRef = useRef<HTMLInputElement>(null);
   const [newCertName, setNewCertName] = useState('');
   const [showAddCert, setShowAddCert] = useState(false);
+  const [emailInput, setEmailInput] = useState('');
+  const [emailError, setEmailError] = useState<string | null>(null);
 
   const handleFieldChange = (field: keyof FactoryInfo, value: any) => {
     onChange({
       ...factoryInfo,
       [field]: value,
     });
+  };
+
+  // Derive normalized multi-email list from contactEmails or comma-separated contactEmail
+  const resolvedContactEmails: string[] = React.useMemo(() => {
+    if (Array.isArray(factoryInfo.contactEmails) && factoryInfo.contactEmails.length > 0) {
+      return factoryInfo.contactEmails.map((e) => e.trim()).filter(Boolean);
+    }
+    if (factoryInfo.contactEmail) {
+      return factoryInfo.contactEmail
+        .split(/[,;\s]+/)
+        .map((e) => e.trim())
+        .filter(Boolean);
+    }
+    return [];
+  }, [factoryInfo.contactEmails, factoryInfo.contactEmail]);
+
+  const updateContactEmailsList = (emails: string[]) => {
+    const deduped = Array.from(new Set(emails.map((e) => e.trim().toLowerCase()).filter(Boolean)));
+    onChange({
+      ...factoryInfo,
+      contactEmails: deduped,
+      contactEmail: deduped.join(', '),
+    });
+  };
+
+  const addEmailsFromRaw = (raw: string) => {
+    const parts = raw
+      .split(/[,;\s\n]+/)
+      .map((p) => p.trim().toLowerCase())
+      .filter(Boolean);
+    if (parts.length === 0) {
+      setEmailError(null);
+      return;
+    }
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    const invalid = parts.filter((p) => !emailRegex.test(p));
+    if (invalid.length > 0) {
+      setEmailError(`Invalid email format: ${invalid.join(', ')}`);
+      const valid = parts.filter((p) => emailRegex.test(p));
+      if (valid.length > 0) {
+        updateContactEmailsList([...resolvedContactEmails, ...valid]);
+      }
+      return;
+    }
+    setEmailError(null);
+    updateContactEmailsList([...resolvedContactEmails, ...parts]);
+    setEmailInput('');
+  };
+
+  const handleRemoveContactEmail = (target: string) => {
+    updateContactEmailsList(resolvedContactEmails.filter((e) => e.toLowerCase() !== target.toLowerCase()));
   };
 
   const handleFacilityToggle = (facilityName: string) => {
@@ -257,6 +312,7 @@ export const PreAuditForm: React.FC<Props> = ({
         contactPerson: '',
         contactPhone: '',
         contactEmail: '',
+        contactEmails: [],
         auditDate: new Date().toISOString().split('T')[0],
         auditDuration: '',
         auditType: 'Annual Audit',
@@ -290,7 +346,19 @@ export const PreAuditForm: React.FC<Props> = ({
           </p>
         </div>
 
-        <div className="flex items-center gap-2 shrink-0">
+        <div className="flex flex-wrap items-center gap-2 shrink-0">
+          {onStartNewAudit && (
+            <button
+              type="button"
+              onClick={onStartNewAudit}
+              className="px-3.5 py-2 text-xs font-bold rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white shadow-sm transition-all flex items-center gap-1.5 cursor-pointer"
+              title="Start a brand new factory audit"
+            >
+              <Plus className="w-3.5 h-3.5" />
+              <span>Start New Factory Audit</span>
+            </button>
+          )}
+
           <button
             type="button"
             onClick={handleClearForm}
@@ -468,18 +536,77 @@ export const PreAuditForm: React.FC<Props> = ({
                 </div>
               </div>
 
-              <div>
-                <label className="block text-xs font-semibold text-slate-700 mb-1">Contact Email</label>
-                <div className="relative">
-                  <Mail className="w-4 h-4 text-slate-400 absolute left-3 top-3 pointer-events-none" />
-                  <input
-                    type="email"
-                    value={factoryInfo.contactEmail}
-                    onChange={(e) => handleFieldChange('contactEmail', e.target.value)}
-                    placeholder="e.g. qms.compliance@northernfashions.com"
-                    className="w-full pl-9 pr-3 py-2 text-sm border border-slate-300 rounded-xl focus:ring-2 focus:ring-blue-600 focus:outline-none"
-                  />
+              <div className="sm:col-span-2">
+                <div className="flex items-center justify-between mb-1">
+                  <label className="block text-xs font-semibold text-slate-700">
+                    Contact Emails (Multiple Recipients Supported)
+                  </label>
+                  <span className="text-[10px] font-semibold text-blue-600">
+                    Auto-receives PDF Report on Submit
+                  </span>
                 </div>
+
+                <div className="border border-slate-300 rounded-xl p-2 bg-white focus-within:ring-2 focus-within:ring-blue-600 space-y-2">
+                  {resolvedContactEmails.length > 0 && (
+                    <div className="flex flex-wrap gap-1.5">
+                      {resolvedContactEmails.map((email) => (
+                        <span
+                          key={email}
+                          className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-blue-50 border border-blue-200 text-blue-900 text-xs font-semibold"
+                        >
+                          <Mail className="w-3 h-3 text-blue-600 shrink-0" />
+                          <span>{email}</span>
+                          <button
+                            type="button"
+                            onClick={() => handleRemoveContactEmail(email)}
+                            className="ml-0.5 text-blue-500 hover:text-red-600 font-bold cursor-pointer leading-none px-1"
+                            title={`Remove ${email}`}
+                          >
+                            ×
+                          </button>
+                        </span>
+                      ))}
+                    </div>
+                  )}
+
+                  <div className="flex items-center gap-2">
+                    <div className="relative flex-1">
+                      <Mail className="w-4 h-4 text-slate-400 absolute left-2.5 top-2.5 pointer-events-none" />
+                      <input
+                        type="text"
+                        value={emailInput}
+                        onChange={(e) => {
+                          setEmailInput(e.target.value);
+                          if (emailError) setEmailError(null);
+                        }}
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter' || e.key === ',' || e.key === ';') {
+                            e.preventDefault();
+                            addEmailsFromRaw(emailInput);
+                          }
+                        }}
+                        onBlur={() => {
+                          if (emailInput.trim()) {
+                            addEmailsFromRaw(emailInput);
+                          }
+                        }}
+                        placeholder="Type email & press Enter or comma (e.g. qa@factory.com, gm@factory.com)"
+                        className="w-full pl-8 pr-3 py-1.5 text-sm bg-transparent focus:outline-none"
+                      />
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => addEmailsFromRaw(emailInput)}
+                      className="px-3 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-700 text-white text-xs font-bold flex items-center gap-1 cursor-pointer shrink-0"
+                    >
+                      <Plus className="w-3.5 h-3.5" />
+                      <span>Add</span>
+                    </button>
+                  </div>
+                </div>
+                {emailError && (
+                  <p className="text-[11px] text-red-600 font-semibold mt-1">{emailError}</p>
+                )}
               </div>
 
               <div>

@@ -474,20 +474,22 @@ export function logoutAuditor(): void {
   }
 }
 
-// Local cache + server sync for audits - STRICTLY RESTRICTED TO ADMIN (quality.bd.eng@gmail.com)
+// Local cache + server sync for audits:
+// - Admin (quality.bd.eng@gmail.com) sees all reports
+// - Regular auditors strictly see ONLY their own submitted audits (for CAP management)
 export async function fetchAllAudits(requesterEmail?: string): Promise<AuditReportData[]> {
-  const adminEmail = requesterEmail || getCurrentUser()?.email;
-  // Security guard: Only Admin can view saved audit archives
-  if (!isAuditorAdmin(adminEmail)) {
+  const effectiveEmail = (requesterEmail || getCurrentUser()?.email || '').trim().toLowerCase();
+  if (!effectiveEmail) {
     return [];
   }
+  const adminAccess = isAuditorAdmin(effectiveEmail);
 
   let serverAudits: AuditReportData[] = [];
   if (await isBackendServerAvailable()) {
     try {
       const res = await fetch('/api/audits', {
         headers: {
-          'x-auditor-email': adminEmail || '',
+          'x-auditor-email': effectiveEmail,
         },
       });
       if (res.ok && res.headers.get('content-type')?.includes('application/json')) {
@@ -501,7 +503,7 @@ export async function fetchAllAudits(requesterEmail?: string): Promise<AuditRepo
   // Load from Firestore (cloud database)
   let firestoreAudits: AuditReportData[] = [];
   try {
-    firestoreAudits = await fetchAuditsFromFirestore(adminEmail);
+    firestoreAudits = await fetchAuditsFromFirestore(effectiveEmail);
   } catch (err) {
     console.warn('Error reading audits from Firestore', err);
   }
@@ -531,10 +533,22 @@ export async function fetchAllAudits(requesterEmail?: string): Promise<AuditRepo
   }
 
   const map = new Map<string, AuditReportData>();
-  localAudits.forEach((a) => map.set(a.id, a));
-  idbAudits.forEach((a) => map.set(a.id, a));
-  firestoreAudits.forEach((a) => map.set(a.id, a));
-  serverAudits.forEach((a) => map.set(a.id, a));
+  const addFiltered = (list: AuditReportData[]) => {
+    list.forEach((a) => {
+      if (!a || !a.id) return;
+      if (adminAccess || (a.auditorEmail && a.auditorEmail.trim().toLowerCase() === effectiveEmail)) {
+        const prev = map.get(a.id);
+        if (!prev || new Date(a.updatedAt || a.createdAt).getTime() >= new Date(prev.updatedAt || prev.createdAt).getTime()) {
+          map.set(a.id, a);
+        }
+      }
+    });
+  };
+
+  addFiltered(localAudits);
+  addFiltered(idbAudits);
+  addFiltered(firestoreAudits);
+  addFiltered(serverAudits);
 
   const merged = Array.from(map.values()).sort(
     (a, b) => new Date(b.updatedAt || b.createdAt).getTime() - new Date(a.updatedAt || a.createdAt).getTime()
@@ -543,7 +557,14 @@ export async function fetchAllAudits(requesterEmail?: string): Promise<AuditRepo
   return merged;
 }
 
-export async function saveAuditReport(report: AuditReportData): Promise<AuditReportData> {
+export async function saveAuditReport(rawReport: AuditReportData): Promise<AuditReportData> {
+  const currentEmail = getCurrentUser()?.email?.trim().toLowerCase();
+  const report: AuditReportData = {
+    ...rawReport,
+    auditorEmail: (rawReport.auditorEmail || currentEmail || '').trim().toLowerCase(),
+    updatedAt: new Date().toISOString(),
+  };
+
   // 1. Save to high-capacity IndexedDB (handles 500+ photos)
   try {
     await saveAuditToIndexedDB(report);
@@ -641,37 +662,193 @@ export async function deleteAuditReport(id: string, requesterEmail?: string): Pr
 
 let cloudSyncTimer: any = null;
 
+function writeLightLocalDraft(draft: any): void {
+  try {
+    if (!draft) {
+      localStorage.removeItem(CURRENT_AUDIT_KEY);
+      return;
+    }
+    const currentEmail = getCurrentUser()?.email?.trim().toLowerCase() || draft.ownerEmail || '';
+    const lightDraft = {
+      ownerEmail: currentEmail,
+      currentTab: draft.currentTab,
+      activeSectionId: draft.activeSectionId,
+      updatedAt: draft.updatedAt || new Date().toISOString(),
+      factoryInfo: {
+        ...draft.factoryInfo,
+        openingMeetingPhoto: draft.factoryInfo?.openingMeetingPhoto ? 'attached' : undefined,
+        factoryOutlookPhotos: [],
+        certifications: draft.factoryInfo?.certifications?.map((c: any) => ({
+          ...c,
+          photo: c.photo ? 'attached' : undefined,
+        })),
+      },
+      sections: draft.sections?.map((s: any) => ({
+        ...s,
+        checkpoints: s.checkpoints?.map((c: any) => ({
+          id: c.id,
+          code: c.code,
+          title: c.title,
+          description: c.description,
+          guidelines: c.guidelines,
+          isCustom: c.isCustom,
+          score: c.score,
+          notes: c.notes,
+        })),
+      })),
+    };
+    localStorage.setItem(CURRENT_AUDIT_KEY, JSON.stringify(lightDraft));
+  } catch {}
+}
+
+export function isValidPhotoUrl(url?: string | null): boolean {
+  if (!url || typeof url !== 'string') return false;
+  return url.startsWith('data:image/') || url.startsWith('http://') || url.startsWith('https://');
+}
+
+/**
+ * Merges a remote or light draft into current local state WITHOUT ever wiping out
+ * real image dataUrls with 'image-attached' or 'attached' placeholders.
+ */
+export function mergeDraftPreservingPhotos(
+  currentFactory: any,
+  currentSections: any[],
+  incomingDraft: any
+): { factoryInfo: any; sections: any[] } {
+  if (!incomingDraft) {
+    return { factoryInfo: currentFactory, sections: currentSections };
+  }
+
+  let mergedFactory = currentFactory;
+  if (incomingDraft.factoryInfo) {
+    const incF = incomingDraft.factoryInfo;
+    const prevOpening = isValidPhotoUrl(currentFactory?.openingMeetingPhoto)
+      ? currentFactory.openingMeetingPhoto
+      : undefined;
+    const incOpening = isValidPhotoUrl(incF.openingMeetingPhoto)
+      ? incF.openingMeetingPhoto
+      : undefined;
+
+    const prevOutlook: any[] = Array.isArray(currentFactory?.factoryOutlookPhotos)
+      ? currentFactory.factoryOutlookPhotos
+      : [];
+    const incOutlook: any[] = Array.isArray(incF.factoryOutlookPhotos)
+      ? incF.factoryOutlookPhotos
+      : [];
+
+    let finalOutlook = prevOutlook;
+    if (incOutlook.length > 0) {
+      finalOutlook = incOutlook
+        .map((item: any) => {
+          if (isValidPhotoUrl(item.dataUrl)) return item;
+          const matchedPrev = prevOutlook.find((p) => p.id === item.id);
+          return matchedPrev && isValidPhotoUrl(matchedPrev.dataUrl)
+            ? { ...matchedPrev, ...item, dataUrl: matchedPrev.dataUrl }
+            : null;
+        })
+        .filter(Boolean);
+    }
+
+    const prevCerts: any[] = Array.isArray(currentFactory?.certifications)
+      ? currentFactory.certifications
+      : [];
+    const incCerts: any[] = Array.isArray(incF.certifications) ? incF.certifications : [];
+    const finalCerts =
+      incCerts.length > 0
+        ? incCerts.map((c: any) => {
+            if (isValidPhotoUrl(c.photo)) return c;
+            const prevC = prevCerts.find((pc) => pc.id === c.id);
+            return prevC && isValidPhotoUrl(prevC.photo) ? { ...c, photo: prevC.photo } : { ...c, photo: undefined };
+          })
+        : prevCerts;
+
+    mergedFactory = {
+      ...currentFactory,
+      ...incF,
+      openingMeetingPhoto: incOpening || prevOpening,
+      factoryOutlookPhotos: finalOutlook,
+      certifications: finalCerts,
+    };
+  }
+
+  let mergedSections = currentSections;
+  if (Array.isArray(incomingDraft.sections) && incomingDraft.sections.length > 0) {
+    mergedSections = incomingDraft.sections.map((incSec: any) => {
+      const prevSec = currentSections?.find((s: any) => s.id === incSec.id);
+      const mergedCheckpoints = (incSec.checkpoints || []).map((incCp: any) => {
+        const prevCp = prevSec?.checkpoints?.find((c: any) => c.id === incCp.id);
+        const prevImgs: any[] = Array.isArray(prevCp?.images) ? prevCp.images : [];
+        const incImgs: any[] = Array.isArray(incCp?.images) ? incCp.images : [];
+
+        let finalImages = prevImgs;
+        if (incImgs.length > 0) {
+          finalImages = incImgs
+            .map((img: any) => {
+              if (isValidPhotoUrl(img.dataUrl)) return img;
+              const matched = prevImgs.find((p) => p.id === img.id);
+              return matched && isValidPhotoUrl(matched.dataUrl)
+                ? { ...matched, ...img, dataUrl: matched.dataUrl }
+                : null;
+            })
+            .filter(Boolean);
+        }
+
+        return {
+          ...(prevCp || {}),
+          ...incCp,
+          images: finalImages,
+        };
+      });
+      return {
+        ...(prevSec || {}),
+        ...incSec,
+        checkpoints: mergedCheckpoints,
+      };
+    });
+  }
+
+  return { factoryInfo: mergedFactory, sections: mergedSections };
+}
+
+export function saveActiveDraftImmediate(draft: any): void {
+  const currentEmail = getCurrentUser()?.email?.trim().toLowerCase() || '';
+  const stampedDraft = draft
+    ? {
+        ...draft,
+        ownerEmail: currentEmail || draft.ownerEmail || '',
+        updatedAt: new Date().toISOString(),
+      }
+    : null;
+
+  writeLightLocalDraft(stampedDraft);
+  if (stampedDraft) {
+    saveDraftToIndexedDB(stampedDraft).catch(() => {});
+    const clientId = getClientDeviceId();
+    syncDraftToFirestore(stampedDraft, clientId, currentEmail).catch(() => {});
+  } else {
+    clearDraftFromIndexedDB().catch(() => {});
+  }
+}
+
 export function saveActiveDraft(draft: any, isExplicitDelete = false): void {
+  const currentEmail = getCurrentUser()?.email?.trim().toLowerCase() || '';
+  const stampedDraft = draft
+    ? {
+        ...draft,
+        ownerEmail: currentEmail || draft.ownerEmail || '',
+        updatedAt: new Date().toISOString(),
+      }
+    : null;
+
   // 1. High-capacity IndexedDB local backup (instant, supports 500-1000+ photos)
-  if (draft) {
-    saveDraftToIndexedDB(draft).catch(() => {});
+  if (stampedDraft) {
+    saveDraftToIndexedDB(stampedDraft).catch(() => {});
   } else {
     clearDraftFromIndexedDB().catch(() => {});
   }
 
   // 2. Ultra-light LocalStorage backup (metadata only, <10KB, never blocks UI thread)
-  try {
-    if (!draft) {
-      localStorage.removeItem(CURRENT_AUDIT_KEY);
-    } else {
-      const lightDraft = {
-        factoryInfo: {
-          ...draft.factoryInfo,
-          openingMeetingPhoto: draft.factoryInfo?.openingMeetingPhoto ? 'attached' : undefined,
-          factoryOutlookPhotos: [],
-        },
-        sections: draft.sections?.map((s: any) => ({
-          ...s,
-          checkpoints: s.checkpoints?.map((c: any) => ({
-            id: c.id,
-            score: c.score,
-            notes: c.notes,
-          })),
-        })),
-      };
-      localStorage.setItem(CURRENT_AUDIT_KEY, JSON.stringify(lightDraft));
-    }
-  } catch {}
+  writeLightLocalDraft(stampedDraft);
 
   // 3. Debounced Cloud Network Sync (Firestore + Server SSE) - avoids freezing UI during rapid inputs
   if (cloudSyncTimer) clearTimeout(cloudSyncTimer);
@@ -681,7 +858,7 @@ export function saveActiveDraft(draft: any, isExplicitDelete = false): void {
     // A. Direct Firestore Real-Time Sync across Mobile APK & Browser
     try {
       const clientId = getClientDeviceId();
-      syncDraftToFirestore(draft, clientId).catch(() => {});
+      syncDraftToFirestore(stampedDraft, clientId, currentEmail).catch(() => {});
     } catch (err) {
       console.warn('Failed triggering Firestore draft sync', err);
     }
@@ -691,10 +868,10 @@ export function saveActiveDraft(draft: any, isExplicitDelete = false): void {
       try {
         const clientId = getClientDeviceId();
         const payload = {
-          ...draft,
+          ...stampedDraft,
           clientId,
           isExplicitDelete,
-          lastUpdatedBy: draft?.factoryInfo?.auditorName || 'Auditor',
+          lastUpdatedBy: stampedDraft?.factoryInfo?.auditorName || 'Auditor',
         };
 
         fetch('/api/active-draft', {

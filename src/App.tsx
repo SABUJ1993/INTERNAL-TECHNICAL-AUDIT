@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useRef } from 'react';
 import {
   AuditReportData,
   AuditSection,
@@ -12,11 +12,13 @@ import {
   AppTab,
   ViewMode,
   CheckpointEvidence,
+  CapItem,
 } from './types/audit';
 import { DEFAULT_CERTIFICATIONS } from './data/defaultCertifications';
 import { DEFAULT_AUDIT_SECTIONS } from './data/defaultCheckpoints';
-import { FACTORY_FACILITIES } from './data/facilities';
-import { calculateAuditReport, calculateSectionSummary } from './utils/scoring';
+import { calculateAuditReport } from './utils/scoring';
+import { buildCapItemsFromReport } from './utils/capHelpers';
+import { generateAuditPdfBlob } from './utils/pdfGenerator';
 import {
   getCurrentUser,
   logoutAuditor,
@@ -24,24 +26,28 @@ import {
   saveAuditReport,
   deleteAuditReport,
   saveActiveDraft,
+  saveActiveDraftImmediate,
   loadActiveDraft,
   loadActiveDraftAsync,
   fetchServerActiveDraft,
   subscribeToLiveDraftStream,
   getClientDeviceId,
+  mergeDraftPreservingPhotos,
 } from './services/api';
-import { subscribeToFirestoreDraft, clearFirestoreDraft, isAuditorAdmin } from './services/firebase';
+import { subscribeToFirestoreDraft, clearFirestoreDraft } from './services/firebase';
 
 import { LoginScreen } from './components/LoginScreen';
 import { Header } from './components/Header';
 import { PreAuditForm } from './components/PreAuditForm';
 import { AuditSectionView } from './components/AuditSectionView';
 import { ReportView } from './components/ReportView';
+import { CapView } from './components/CapView';
 import { SavedAuditsView } from './components/SavedAuditsView';
 import { ImagePreviewModal } from './components/ImagePreviewModal';
 import { DeviceSimulatorWrapper } from './components/DeviceSimulatorWrapper';
 import { ShareAppModal } from './components/ShareAppModal';
 import { PhotoActionModal, PhotoLocation } from './components/PhotoActionModal';
+import { EmailDispatchModal } from './components/EmailDispatchModal';
 import { useAppUpdate } from './hooks/useAppUpdate';
 import { UpdateNotificationToast } from './components/UpdateNotificationToast';
 
@@ -54,6 +60,7 @@ const DEFAULT_FACTORY_DATA: FactoryInfo = {
   contactPerson: '',
   contactPhone: '',
   contactEmail: '',
+  contactEmails: [],
   auditDate: new Date().toISOString().split('T')[0],
   auditDuration: '',
   auditorName: '',
@@ -90,13 +97,18 @@ function normalizeAuditSections(rawSections: AuditSection[]): AuditSection[] {
 }
 
 export default function App() {
-  // Rehydrate authenticated session from localStorage (prevents auto-logout on mobile scroll/swipe refresh)
   const [currentUser, setCurrentUser] = useState<AuditorUser | null>(() => getCurrentUser());
-  const [currentTab, setCurrentTab] = useState<AppTab>('pre-audit');
+  const [currentTab, setCurrentTab] = useState<AppTab>(() => {
+    const draft = loadActiveDraft();
+    const savedTab = draft?.currentTab;
+    if (savedTab === 'pre-audit' || savedTab === 'audit' || savedTab === 'report' || savedTab === 'cap') {
+      return savedTab;
+    }
+    return 'pre-audit';
+  });
   const [viewMode, setViewMode] = useState<ViewMode>('auto');
   const [isShareModalOpen, setIsShareModalOpen] = useState(false);
 
-  // Automatic in-app update detector (checks for new GitHub/Netlify versions)
   const {
     updateAvailable,
     newVersion,
@@ -115,8 +127,16 @@ export default function App() {
       return {
         ...DEFAULT_FACTORY_DATA,
         ...draft.factoryInfo,
-        auditDuration: '',
+        openingMeetingPhoto:
+          draft.factoryInfo.openingMeetingPhoto && draft.factoryInfo.openingMeetingPhoto !== 'attached'
+            ? draft.factoryInfo.openingMeetingPhoto
+            : undefined,
         auditType: draft.factoryInfo.auditType || 'Annual Audit',
+        contactEmails: Array.isArray(draft.factoryInfo.contactEmails)
+          ? draft.factoryInfo.contactEmails
+          : draft.factoryInfo.contactEmail
+          ? draft.factoryInfo.contactEmail.split(/[,;\s]+/).map((e: string) => e.trim()).filter(Boolean)
+          : [],
         factoryOutlookPhotos: draft.factoryInfo.factoryOutlookPhotos || [],
       };
     }
@@ -147,7 +167,10 @@ export default function App() {
   const [isSaved, setIsSaved] = useState(true);
   const [isLiveConnected, setIsLiveConnected] = useState(true);
   const [syncMessage, setSyncMessage] = useState<string>('Live Synced');
-  const [activeSectionId, setActiveSectionId] = useState<string>(() => sections[0]?.id || 'warehouse');
+  const [activeSectionId, setActiveSectionId] = useState<string>(() => {
+    const draft = loadActiveDraft();
+    return draft?.activeSectionId || sections[0]?.id || 'warehouse';
+  });
 
   const [photoActionState, setPhotoActionState] = useState<{
     isOpen: boolean;
@@ -159,9 +182,39 @@ export default function App() {
     sourceLocation: null,
   });
 
-  const isRemoteUpdateRef = React.useRef(false);
-  const isInitializedRef = React.useRef(false);
-  const syncTimeoutRef = React.useRef<any>(null);
+  const [emailModalState, setEmailModalState] = useState<{
+    isOpen: boolean;
+    report: AuditReportData | null;
+    pdfBlob: Blob | null;
+    pdfFileName: string;
+    autoDownloaded: boolean;
+  }>({
+    isOpen: false,
+    report: null,
+    pdfBlob: null,
+    pdfFileName: '',
+    autoDownloaded: false,
+  });
+
+  const isRemoteUpdateRef = useRef(false);
+  const isInitializedRef = useRef(false);
+  const syncTimeoutRef = useRef<any>(null);
+
+  // Refs holding latest state so mobile minimize / visibilitychange flush always saves fresh data & photos
+  const latestDraftRef = useRef({
+    factoryInfo,
+    sections,
+    currentTab,
+    activeSectionId,
+  });
+  useEffect(() => {
+    latestDraftRef.current = {
+      factoryInfo,
+      sections,
+      currentTab,
+      activeSectionId,
+    };
+  }, [factoryInfo, sections, currentTab, activeSectionId]);
 
   // Sync auditor name into factory info on login
   useEffect(() => {
@@ -170,54 +223,52 @@ export default function App() {
     }
   }, [currentUser]);
 
-  // Load saved audits on startup (strictly for Admin)
+  // Load saved audits on startup (Admin sees all; regular auditor sees only their own audits for CAP)
   useEffect(() => {
-    if (currentUser && isAuditorAdmin(currentUser.email)) {
+    if (currentUser?.email) {
       fetchAllAudits(currentUser.email).then((list) => setSavedAudits(list));
     } else {
       setSavedAudits([]);
     }
   }, [currentUser]);
 
-  // Security guard: Ensure non-admins cannot stay in saved-audits tab
-  useEffect(() => {
-    if (currentTab === 'saved-audits' && !isAuditorAdmin(currentUser?.email)) {
-      setCurrentTab('pre-audit');
-    }
-  }, [currentTab, currentUser]);
-
-  // Initial local IndexedDB + cloud draft retrieval on mount/login
+  // Initial local IndexedDB + cloud draft retrieval on mount/login (preserving all photos!)
   useEffect(() => {
     if (!currentUser) return;
+    const normalizedEmail = currentUser.email.trim().toLowerCase();
 
-    // 1. First load high-capacity IndexedDB draft (so 500+ photos load immediately)
+    // 1. Load high-capacity IndexedDB draft (500+ photos)
     loadActiveDraftAsync().then((localDbDraft) => {
       if (localDbDraft && (localDbDraft.factoryInfo || localDbDraft.sections)) {
+        const ownerMatch =
+          !localDbDraft.ownerEmail || localDbDraft.ownerEmail.trim().toLowerCase() === normalizedEmail;
         if (
+          ownerMatch &&
           localDbDraft.factoryInfo?.name !== 'Northern Fashions Ltd.' &&
           localDbDraft.factoryInfo?.name !== 'Apex Textile Mills Ltd.'
         ) {
-          if (localDbDraft.factoryInfo) {
-            setFactoryInfo((prev) => ({
-              ...prev,
-              ...localDbDraft.factoryInfo,
-              openingMeetingPhoto: localDbDraft.factoryInfo.openingMeetingPhoto || undefined,
-              openingMeetingPhotoTimestamp: localDbDraft.factoryInfo.openingMeetingPhotoTimestamp || undefined,
-              openingMeetingPhotoConfirmed: localDbDraft.factoryInfo.openingMeetingPhotoConfirmed || undefined,
-              openingMeetingPhotoAspectRatio: localDbDraft.factoryInfo.openingMeetingPhotoAspectRatio || undefined,
-              factoryOutlookPhotos: Array.isArray(localDbDraft.factoryInfo.factoryOutlookPhotos)
-                ? localDbDraft.factoryInfo.factoryOutlookPhotos
-                : [],
-            }));
-          }
+          setFactoryInfo((prev) => {
+            const merged = mergeDraftPreservingPhotos(prev, sections, localDbDraft);
+            return {
+              ...DEFAULT_FACTORY_DATA,
+              ...merged.factoryInfo,
+            };
+          });
           if (localDbDraft.sections && Array.isArray(localDbDraft.sections)) {
-            setSections(normalizeAuditSections(localDbDraft.sections));
+            setSections((prevSec) =>
+              normalizeAuditSections(
+                mergeDraftPreservingPhotos(factoryInfo, prevSec, localDbDraft).sections
+              )
+            );
+          }
+          if (localDbDraft.activeSectionId) {
+            setActiveSectionId(localDbDraft.activeSectionId);
           }
         }
       }
     });
 
-    // 2. Fetch server draft for live sync
+    // 2. Fetch server draft for live sync without clobbering IndexedDB photos
     fetchServerActiveDraft()
       .then((serverDraft) => {
         if (serverDraft) {
@@ -228,23 +279,19 @@ export default function App() {
             fetch('/api/active-draft', { method: 'DELETE' }).catch(() => {});
             return;
           }
+          const ownerMatch =
+            !serverDraft.ownerEmail || serverDraft.ownerEmail.trim().toLowerCase() === normalizedEmail;
+          if (!ownerMatch) return;
+
           isRemoteUpdateRef.current = true;
-          if (serverDraft.factoryInfo) {
-            setFactoryInfo((prev) => ({
-              ...prev,
-              ...serverDraft.factoryInfo,
-              openingMeetingPhoto: serverDraft.factoryInfo.openingMeetingPhoto || undefined,
-              openingMeetingPhotoTimestamp: serverDraft.factoryInfo.openingMeetingPhotoTimestamp || undefined,
-              openingMeetingPhotoConfirmed: serverDraft.factoryInfo.openingMeetingPhotoConfirmed || undefined,
-              openingMeetingPhotoAspectRatio: serverDraft.factoryInfo.openingMeetingPhotoAspectRatio || undefined,
-              factoryOutlookPhotos: Array.isArray(serverDraft.factoryInfo.factoryOutlookPhotos)
-                ? serverDraft.factoryInfo.factoryOutlookPhotos
-                : [],
-            }));
-          }
-          if (serverDraft.sections && Array.isArray(serverDraft.sections)) {
-            setSections(normalizeAuditSections(serverDraft.sections));
-          }
+          setFactoryInfo((prevFactory) => {
+            const merged = mergeDraftPreservingPhotos(prevFactory, latestDraftRef.current.sections, serverDraft);
+            return { ...DEFAULT_FACTORY_DATA, ...merged.factoryInfo };
+          });
+          setSections((prevSections) => {
+            const merged = mergeDraftPreservingPhotos(latestDraftRef.current.factoryInfo, prevSections, serverDraft);
+            return normalizeAuditSections(merged.sections);
+          });
           setTimeout(() => {
             isRemoteUpdateRef.current = false;
           }, 500);
@@ -255,29 +302,25 @@ export default function App() {
       });
   }, [currentUser]);
 
-  // Real-time Server-Sent Events stream: instantly push updates from mobile to PC
+  // Real-time Server-Sent Events stream (when Express backend runs)
   useEffect(() => {
     if (!currentUser) return;
+    const normalizedEmail = currentUser.email.trim().toLowerCase();
 
     const unsubscribe = subscribeToLiveDraftStream(
       (remoteDraft) => {
+        if (remoteDraft.ownerEmail && remoteDraft.ownerEmail.trim().toLowerCase() !== normalizedEmail) {
+          return;
+        }
         isRemoteUpdateRef.current = true;
-        if (remoteDraft.factoryInfo) {
-          setFactoryInfo((prev) => ({
-            ...prev,
-            ...remoteDraft.factoryInfo,
-            openingMeetingPhoto: remoteDraft.factoryInfo.openingMeetingPhoto || undefined,
-            openingMeetingPhotoTimestamp: remoteDraft.factoryInfo.openingMeetingPhotoTimestamp || undefined,
-            openingMeetingPhotoConfirmed: remoteDraft.factoryInfo.openingMeetingPhotoConfirmed || undefined,
-            openingMeetingPhotoAspectRatio: remoteDraft.factoryInfo.openingMeetingPhotoAspectRatio || undefined,
-            factoryOutlookPhotos: Array.isArray(remoteDraft.factoryInfo.factoryOutlookPhotos)
-              ? remoteDraft.factoryInfo.factoryOutlookPhotos
-              : [],
-          }));
-        }
-        if (remoteDraft.sections && Array.isArray(remoteDraft.sections)) {
-          setSections(normalizeAuditSections(remoteDraft.sections));
-        }
+        setFactoryInfo((prevFactory) => {
+          const merged = mergeDraftPreservingPhotos(prevFactory, latestDraftRef.current.sections, remoteDraft);
+          return { ...DEFAULT_FACTORY_DATA, ...merged.factoryInfo };
+        });
+        setSections((prevSections) => {
+          const merged = mergeDraftPreservingPhotos(latestDraftRef.current.factoryInfo, prevSections, remoteDraft);
+          return normalizeAuditSections(merged.sections);
+        });
 
         const sender = remoteDraft.lastUpdatedBy || 'Mobile Device';
         setSyncMessage(`Live update from ${sender}`);
@@ -301,47 +344,43 @@ export default function App() {
     };
   }, [currentUser]);
 
-  // Real-time Firestore Cloud Sync (works directly across Mobile APK and PC Browser)
+  // Real-time Firestore Cloud Sync scoped to current user email (never overwrites local photos with placeholders)
   useEffect(() => {
     if (!currentUser) return;
 
     const clientId = getClientDeviceId();
-    const unsubscribeFirestore = subscribeToFirestoreDraft((remoteDraft) => {
-      isRemoteUpdateRef.current = true;
-      if (remoteDraft.factoryInfo) {
-        setFactoryInfo((prev) => ({
-          ...prev,
-          ...remoteDraft.factoryInfo,
-          openingMeetingPhoto: remoteDraft.factoryInfo.openingMeetingPhoto || undefined,
-          openingMeetingPhotoTimestamp: remoteDraft.factoryInfo.openingMeetingPhotoTimestamp || undefined,
-          openingMeetingPhotoConfirmed: remoteDraft.factoryInfo.openingMeetingPhotoConfirmed || undefined,
-          openingMeetingPhotoAspectRatio: remoteDraft.factoryInfo.openingMeetingPhotoAspectRatio || undefined,
-          factoryOutlookPhotos: Array.isArray(remoteDraft.factoryInfo.factoryOutlookPhotos)
-            ? remoteDraft.factoryInfo.factoryOutlookPhotos
-            : [],
-        }));
-      }
-      if (remoteDraft.sections && Array.isArray(remoteDraft.sections)) {
-        setSections(normalizeAuditSections(remoteDraft.sections));
-      }
+    const unsubscribeFirestore = subscribeToFirestoreDraft(
+      (remoteDraft) => {
+        isRemoteUpdateRef.current = true;
+        setFactoryInfo((prevFactory) => {
+          const merged = mergeDraftPreservingPhotos(prevFactory, latestDraftRef.current.sections, remoteDraft);
+          return { ...DEFAULT_FACTORY_DATA, ...merged.factoryInfo };
+        });
+        setSections((prevSections) => {
+          const merged = mergeDraftPreservingPhotos(latestDraftRef.current.factoryInfo, prevSections, remoteDraft);
+          return normalizeAuditSections(merged.sections);
+        });
 
-      setSyncMessage('Firebase Cloud Synced');
-      if (syncTimeoutRef.current) clearTimeout(syncTimeoutRef.current);
-      syncTimeoutRef.current = setTimeout(() => {
-        setSyncMessage('Live Synced');
-      }, 3000);
+        setSyncMessage('Firebase Cloud Synced');
+        if (syncTimeoutRef.current) clearTimeout(syncTimeoutRef.current);
+        syncTimeoutRef.current = setTimeout(() => {
+          setSyncMessage('Live Synced');
+        }, 3000);
 
-      setTimeout(() => {
-        isRemoteUpdateRef.current = false;
-      }, 500);
-    }, clientId);
+        setTimeout(() => {
+          isRemoteUpdateRef.current = false;
+        }, 500);
+      },
+      clientId,
+      currentUser.email
+    );
 
     return () => {
       unsubscribeFirestore();
     };
   }, [currentUser]);
 
-  // Auto-save draft on changes (Only fires AFTER server draft is safely initialized)
+  // Auto-save draft on changes (after initial load)
   useEffect(() => {
     if (!currentUser || !isInitializedRef.current || isRemoteUpdateRef.current) {
       return;
@@ -349,11 +388,41 @@ export default function App() {
 
     setIsSaved(false);
     const timer = setTimeout(() => {
-      saveActiveDraft({ factoryInfo, sections });
+      saveActiveDraft({
+        factoryInfo,
+        sections,
+        currentTab,
+        activeSectionId,
+      });
       setIsSaved(true);
-    }, 1000);
+    }, 600);
     return () => clearTimeout(timer);
-  }, [factoryInfo, sections, currentUser]);
+  }, [factoryInfo, sections, currentTab, activeSectionId, currentUser]);
+
+  // Instant flush on mobile minimize / tab switch / pagehide so ZERO data or photos are ever lost
+  useEffect(() => {
+    if (!currentUser) return;
+    const flushNow = () => {
+      if (!isInitializedRef.current) return;
+      saveActiveDraftImmediate(latestDraftRef.current);
+    };
+
+    const handleVisibility = () => {
+      if (document.visibilityState === 'hidden') {
+        flushNow();
+      }
+    };
+
+    document.addEventListener('visibilitychange', handleVisibility);
+    window.addEventListener('pagehide', flushNow);
+    window.addEventListener('beforeunload', flushNow);
+
+    return () => {
+      document.removeEventListener('visibilitychange', handleVisibility);
+      window.removeEventListener('pagehide', flushNow);
+      window.removeEventListener('beforeunload', flushNow);
+    };
+  }, [currentUser]);
 
   const handleOpenPhotoAction = (
     evidence: CheckpointEvidence,
@@ -381,7 +450,6 @@ export default function App() {
     let updatedFactory = { ...factoryInfo };
     let updatedSections = [...sections];
 
-    // 1. Add to target
     if (target.type === 'outlook') {
       const current = updatedFactory.factoryOutlookPhotos || [];
       updatedFactory.factoryOutlookPhotos = [...current, newEvidence];
@@ -403,7 +471,6 @@ export default function App() {
       }));
     }
 
-    // 2. If move, remove from source
     if (action === 'move') {
       if (source.type === 'outlook') {
         updatedFactory.factoryOutlookPhotos = (updatedFactory.factoryOutlookPhotos || []).filter(
@@ -430,7 +497,12 @@ export default function App() {
 
     setFactoryInfo(updatedFactory);
     setSections(updatedSections);
-    saveActiveDraft({ factoryInfo: updatedFactory, sections: updatedSections }, action === 'move');
+    saveActiveDraftImmediate({
+      factoryInfo: updatedFactory,
+      sections: updatedSections,
+      currentTab,
+      activeSectionId,
+    });
     setSyncMessage(`Photo ${action === 'copy' ? 'Copied' : 'Transferred'}`);
     setTimeout(() => setSyncMessage('Live Synced'), 2500);
   };
@@ -441,12 +513,15 @@ export default function App() {
       const serverDraft = await fetchServerActiveDraft();
       if (serverDraft) {
         isRemoteUpdateRef.current = true;
-        if (serverDraft.factoryInfo) {
-          setFactoryInfo((prev) => ({ ...prev, ...serverDraft.factoryInfo }));
-        }
-        if (serverDraft.sections) {
-          setSections(normalizeAuditSections(serverDraft.sections));
-        }
+        setFactoryInfo((prev) => ({
+          ...prev,
+          ...mergeDraftPreservingPhotos(prev, latestDraftRef.current.sections, serverDraft).factoryInfo,
+        }));
+        setSections((prev) =>
+          normalizeAuditSections(
+            mergeDraftPreservingPhotos(latestDraftRef.current.factoryInfo, prev, serverDraft).sections
+          )
+        );
         setTimeout(() => {
           isRemoteUpdateRef.current = false;
         }, 400);
@@ -498,6 +573,29 @@ export default function App() {
     };
   }, [sections]);
 
+  // Active Report object
+  const activeReportData: AuditReportData = useMemo(() => {
+    const computed = calculateAuditReport(
+      factoryInfo,
+      sections,
+      currentReport?.id,
+      currentReport?.createdAt
+    );
+    return {
+      ...computed,
+      auditorEmail: currentReport?.auditorEmail || currentUser?.email?.toLowerCase(),
+      submittedAt: currentReport?.submittedAt,
+      capItems: currentReport?.capItems,
+      capUpdatedAt: currentReport?.capUpdatedAt,
+    };
+  }, [factoryInfo, sections, currentReport, currentUser]);
+
+  const activeCapItems = useMemo(() => buildCapItemsFromReport(activeReportData), [activeReportData]);
+  const openCapCount = useMemo(
+    () => activeCapItems.filter((c) => c.status !== 'closed').length,
+    [activeCapItems]
+  );
+
   const handleLoginSuccess = (user: AuditorUser) => {
     setCurrentUser(user);
     setFactoryInfo((prev) => ({
@@ -508,34 +606,115 @@ export default function App() {
   };
 
   const handleLogout = () => {
+    saveActiveDraftImmediate(latestDraftRef.current);
     logoutAuditor();
     setCurrentUser(null);
   };
 
-  const handleSubmitAndGenerateReport = () => {
-    // Generate full report data
-    const report = calculateAuditReport(factoryInfo, sections, currentReport?.id, currentReport?.createdAt);
-    setCurrentReport(report);
-    setCurrentTab('report');
-
-    // Automatically save report to list
-    saveAuditReport(report).then((saved) => {
-      setSavedAudits((prev) => {
-        const idx = prev.findIndex((a) => a.id === saved.id);
-        if (idx >= 0) {
-          const copy = [...prev];
-          copy[idx] = saved;
-          return copy;
-        }
-        return [saved, ...prev];
+  const triggerOpenEmailModal = async (reportToSend: AuditReportData, autoDownload: boolean) => {
+    try {
+      const { blob, fileName } = await generateAuditPdfBlob(reportToSend);
+      if (autoDownload) {
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = fileName;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
+      }
+      setEmailModalState({
+        isOpen: true,
+        report: reportToSend,
+        pdfBlob: blob,
+        pdfFileName: fileName,
+        autoDownloaded: autoDownload,
       });
+    } catch (err) {
+      console.error('Error preparing PDF for dispatch', err);
+      setEmailModalState({
+        isOpen: true,
+        report: reportToSend,
+        pdfBlob: null,
+        pdfFileName: '',
+        autoDownloaded: false,
+      });
+    }
+  };
+
+  const handleSubmitAndGenerateReport = async () => {
+    const baseReport = calculateAuditReport(
+      factoryInfo,
+      sections,
+      currentReport?.id,
+      currentReport?.createdAt
+    );
+    const derivedCaps = buildCapItemsFromReport({
+      ...baseReport,
+      capItems: currentReport?.capItems,
     });
 
+    const submittedReport: AuditReportData = {
+      ...baseReport,
+      auditorEmail: currentUser?.email?.trim().toLowerCase() || '',
+      submittedAt: new Date().toISOString(),
+      capItems: derivedCaps,
+      capUpdatedAt: currentReport?.capUpdatedAt || new Date().toISOString(),
+    };
+
+    setCurrentReport(submittedReport);
+    setCurrentTab('report');
     window.scrollTo({ top: 0, behavior: 'smooth' });
+
+    const saved = await saveAuditReport(submittedReport);
+    setSavedAudits((prev) => {
+      const idx = prev.findIndex((a) => a.id === saved.id);
+      if (idx >= 0) {
+        const copy = [...prev];
+        copy[idx] = saved;
+        return copy;
+      }
+      return [saved, ...prev];
+    });
+
+    // Check if contact emails exist -> auto-generate & download PDF and open dispatch dialog
+    const hasContactEmails =
+      (factoryInfo.contactEmails && factoryInfo.contactEmails.length > 0) ||
+      Boolean(factoryInfo.contactEmail && factoryInfo.contactEmail.trim());
+
+    if (hasContactEmails) {
+      await triggerOpenEmailModal(saved, true);
+    }
   };
 
   const handleSaveReportDirect = async (report: AuditReportData) => {
-    const saved = await saveAuditReport(report);
+    const reportWithOwner: AuditReportData = {
+      ...report,
+      auditorEmail: report.auditorEmail || currentUser?.email?.trim().toLowerCase() || '',
+    };
+    const saved = await saveAuditReport(reportWithOwner);
+    setCurrentReport(saved);
+    setSavedAudits((prev) => {
+      const idx = prev.findIndex((a) => a.id === saved.id);
+      if (idx >= 0) {
+        const copy = [...prev];
+        copy[idx] = saved;
+        return copy;
+      }
+      return [saved, ...prev];
+    });
+  };
+
+  const handleUpdateCapItems = async (updatedCapItems: CapItem[]) => {
+    const updatedReport: AuditReportData = {
+      ...activeReportData,
+      auditorEmail: activeReportData.auditorEmail || currentUser?.email?.trim().toLowerCase() || '',
+      capItems: updatedCapItems,
+      capUpdatedAt: new Date().toISOString(),
+    };
+    setCurrentReport(updatedReport);
+    const saved = await saveAuditReport(updatedReport);
     setSavedAudits((prev) => {
       const idx = prev.findIndex((a) => a.id === saved.id);
       if (idx >= 0) {
@@ -555,28 +734,53 @@ export default function App() {
   const handleLoadAudit = (audit: AuditReportData) => {
     setCurrentReport(audit);
     setFactoryInfo(audit.factoryInfo);
-    setSections(audit.sections);
+    setSections(normalizeAuditSections(audit.sections));
     setCurrentTab('report');
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  };
+
+  const handleOpenCapForAudit = (audit: AuditReportData) => {
+    setCurrentReport(audit);
+    setFactoryInfo(audit.factoryInfo);
+    setSections(normalizeAuditSections(audit.sections));
+    setCurrentTab('cap');
+    window.scrollTo({ top: 0, behavior: 'smooth' });
   };
 
   const handleStartNewAudit = () => {
-    setFactoryInfo({
+    const freshFactory: FactoryInfo = {
       ...DEFAULT_FACTORY_DATA,
       auditorName: currentUser?.name || '',
+      auditorTitle: currentUser?.role || '',
       auditDate: new Date().toISOString().split('T')[0],
       auditReportNo: '',
       factoryRegistrationNo: '',
-    });
-    setSections(DEFAULT_AUDIT_SECTIONS);
+      facilities: [],
+      certifications: DEFAULT_CERTIFICATIONS.map((c) => ({ ...c, selected: false, photo: undefined })),
+      factoryOutlookPhotos: [],
+      contactEmails: [],
+    };
+    const freshSections = DEFAULT_AUDIT_SECTIONS.map((sec) => ({
+      ...sec,
+      checkpoints: sec.checkpoints.map((cp) => ({
+        ...cp,
+        score: null,
+        notes: '',
+        images: [],
+      })),
+    }));
+
+    setFactoryInfo(freshFactory);
+    setSections(freshSections);
     setCurrentReport(null);
     setCurrentTab('pre-audit');
-    saveActiveDraft(null);
+    saveActiveDraft(null, true);
+    clearFirestoreDraft(currentUser?.email).catch(() => {});
     setSyncMessage('New Audit Initialized');
     setTimeout(() => setSyncMessage('Live Synced'), 2000);
   };
 
   const handleClearAllData = async () => {
-
     const cleanFactory: FactoryInfo = {
       ...DEFAULT_FACTORY_DATA,
       auditorName: currentUser?.name || '',
@@ -587,6 +791,7 @@ export default function App() {
       facilities: [],
       certifications: DEFAULT_CERTIFICATIONS.map((c) => ({ ...c, selected: false, photo: undefined })),
       factoryOutlookPhotos: [],
+      contactEmails: [],
     };
 
     const cleanSections = DEFAULT_AUDIT_SECTIONS.map((sec) => ({
@@ -613,7 +818,7 @@ export default function App() {
     } catch {}
 
     try {
-      await clearFirestoreDraft();
+      await clearFirestoreDraft(currentUser?.email);
     } catch {}
 
     setSyncMessage('All Data Cleared & Reset');
@@ -670,14 +875,15 @@ export default function App() {
     setSections(updatedSections);
     setFactoryInfo(updatedFactory);
     setActivePreviewImage(null);
-    saveActiveDraft({ factoryInfo: updatedFactory, sections: updatedSections }, true);
+    saveActiveDraftImmediate({
+      factoryInfo: updatedFactory,
+      sections: updatedSections,
+      currentTab,
+      activeSectionId,
+    });
     setSyncMessage('Photo Deleted');
     setTimeout(() => setSyncMessage('Live Synced'), 2500);
   };
-
-  // Active Report object: either existing completed report or computed live report
-  const activeReportData =
-    currentReport || calculateAuditReport(factoryInfo, sections);
 
   return (
     <DeviceSimulatorWrapper viewMode={viewMode} onViewModeChange={setViewMode}>
@@ -703,9 +909,11 @@ export default function App() {
         onManualSync={handleManualSync}
         updateAvailable={updateAvailable}
         onApplyUpdate={applyUpdate}
+        openCapCount={openCapCount}
+        totalCapCount={activeCapItems.length}
       />
 
-      {/* Main Tab Content - Full Responsive Width on Desktop, Fluid on Mobile */}
+      {/* Main Tab Content */}
       <main className="flex-1 w-full max-w-[1720px] mx-auto px-3 sm:px-6 lg:px-8 xl:px-10 py-4 sm:py-6">
         {currentTab === 'pre-audit' && (
           <PreAuditForm
@@ -715,6 +923,7 @@ export default function App() {
             onOpenPreviewImage={(evidence) => setActivePreviewImage(evidence)}
             onOpenPhotoAction={handleOpenPhotoAction}
             onClearAllData={handleClearAllData}
+            onStartNewAudit={handleStartNewAudit}
           />
         )}
 
@@ -740,6 +949,18 @@ export default function App() {
             onSaveReport={handleSaveReportDirect}
             onOpenPreviewImage={setActivePreviewImage}
             onOpenShareModal={() => setIsShareModalOpen(true)}
+            onOpenCap={() => setCurrentTab('cap')}
+            onEmailReport={() => triggerOpenEmailModal(activeReportData, true)}
+          />
+        )}
+
+        {currentTab === 'cap' && (
+          <CapView
+            report={activeReportData}
+            currentUser={currentUser}
+            onUpdateCapItems={handleUpdateCapItems}
+            onBackToReport={() => setCurrentTab('report')}
+            onOpenPreviewImage={setActivePreviewImage}
           />
         )}
 
@@ -747,6 +968,7 @@ export default function App() {
           <SavedAuditsView
             audits={savedAudits}
             onLoadAudit={handleLoadAudit}
+            onOpenCap={handleOpenCapForAudit}
             onDeleteAudit={handleDeleteAudit}
             onStartNewAudit={handleStartNewAudit}
             currentUser={currentUser}
@@ -775,7 +997,7 @@ export default function App() {
         }
       />
 
-      {/* Universal Photo Action Modal (Move / Copy between any checkpoint or factory outlook) */}
+      {/* Universal Photo Action Modal */}
       <PhotoActionModal
         isOpen={photoActionState.isOpen}
         evidence={photoActionState.evidence}
@@ -788,6 +1010,21 @@ export default function App() {
             evidence: null,
             sourceLocation: null,
           })
+        }
+      />
+
+      {/* Email PDF Dispatch Modal */}
+      <EmailDispatchModal
+        isOpen={emailModalState.isOpen}
+        report={emailModalState.report}
+        pdfBlob={emailModalState.pdfBlob}
+        pdfFileName={emailModalState.pdfFileName}
+        autoDownloaded={emailModalState.autoDownloaded}
+        onClose={() =>
+          setEmailModalState((prev) => ({
+            ...prev,
+            isOpen: false,
+          }))
         }
       />
 

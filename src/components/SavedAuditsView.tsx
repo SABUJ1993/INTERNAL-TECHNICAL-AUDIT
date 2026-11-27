@@ -4,23 +4,23 @@ import {
   Download,
   Trash2,
   Calendar,
-  Building2,
   Plus,
   ArrowRight,
-  CheckCircle2,
-  AlertTriangle,
   ShieldCheck,
-  ShieldAlert,
   Cloud,
+  ClipboardCheck,
+  UserCheck,
 } from 'lucide-react';
 import { AuditReportData, AuditorUser } from '../types/audit';
-import { generateAuditPdf } from '../utils/pdfGenerator';
+import { generateAuditPdf, generateCapPdf } from '../utils/pdfGenerator';
 import { getScoreBandMeta } from '../utils/scoring';
 import { ADMIN_EMAIL, isAuditorAdmin } from '../services/firebase';
+import { buildCapItemsFromReport } from '../utils/capHelpers';
 
 interface Props {
   audits: AuditReportData[];
   onLoadAudit: (audit: AuditReportData) => void;
+  onOpenCap: (audit: AuditReportData) => void;
   onDeleteAudit: (id: string) => void;
   onStartNewAudit: () => void;
   currentUser?: AuditorUser | null;
@@ -29,6 +29,7 @@ interface Props {
 export const SavedAuditsView: React.FC<Props> = ({
   audits,
   onLoadAudit,
+  onOpenCap,
   onDeleteAudit,
   onStartNewAudit,
   currentUser,
@@ -38,36 +39,8 @@ export const SavedAuditsView: React.FC<Props> = ({
 
   const isAdmin = isAuditorAdmin(currentUser?.email);
 
-  if (!isAdmin) {
-    return (
-      <div className="max-w-4xl mx-auto py-12 px-4 animate-in fade-in duration-150">
-        <div className="bg-white rounded-2xl p-8 sm:p-10 border border-slate-200 shadow-sm text-center space-y-4">
-          <div className="w-14 h-14 bg-red-50 border border-red-200 rounded-2xl flex items-center justify-center mx-auto text-red-600">
-            <ShieldAlert className="w-8 h-8" />
-          </div>
-          <div>
-            <h2 className="text-xl font-black text-slate-900 tracking-tight">
-              Admin Access Only
-            </h2>
-            <p className="text-xs sm:text-sm text-slate-600 mt-2 max-w-md mx-auto leading-relaxed">
-              Saved audit archives are strictly restricted to the designated Admin: <strong className="font-mono text-slate-800">{ADMIN_EMAIL}</strong>. Other users cannot view, access, or modify stored assessments.
-            </p>
-          </div>
-          <div className="pt-2">
-            <button
-              type="button"
-              onClick={onStartNewAudit}
-              className="px-5 py-2.5 rounded-xl bg-blue-600 hover:bg-blue-700 text-white font-bold text-xs sm:text-sm shadow-md transition-all cursor-pointer"
-            >
-              Continue to Pre-Audit Inspection
-            </button>
-          </div>
-        </div>
-      </div>
-    );
-  }
-
   const handleDelete = async (id: string) => {
+    if (!isAdmin) return;
     try {
       setIsDeleting(true);
       await onDeleteAudit(id);
@@ -79,20 +52,29 @@ export const SavedAuditsView: React.FC<Props> = ({
 
   return (
     <div className="w-full max-w-[1720px] mx-auto space-y-5 pb-20 animate-in fade-in duration-150">
-      {/* Top Banner with Admin Verification Badge */}
+      {/* Top Banner */}
       <div className="bg-white rounded-2xl p-5 sm:p-6 border border-slate-200 shadow-sm flex flex-col sm:flex-row sm:items-center justify-between gap-4">
         <div>
           <div className="flex items-center gap-2 mb-1.5 flex-wrap">
             <h1 className="text-xl sm:text-2xl font-black text-slate-900 tracking-tight">
-              Saved Audit Records &amp; Archives
+              {isAdmin ? 'Saved Audit Records & CAP Archives' : 'My Submitted Factory Audits & CAP'}
             </h1>
-            <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[11px] font-bold bg-emerald-100 text-emerald-800 border border-emerald-300">
-              <ShieldCheck className="w-3.5 h-3.5 text-emerald-600" />
-              <span>Admin Verified: {ADMIN_EMAIL}</span>
-            </span>
+            {isAdmin ? (
+              <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[11px] font-bold bg-emerald-100 text-emerald-800 border border-emerald-300">
+                <ShieldCheck className="w-3.5 h-3.5 text-emerald-600" />
+                <span>Admin: {ADMIN_EMAIL}</span>
+              </span>
+            ) : (
+              <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[11px] font-bold bg-blue-100 text-blue-800 border border-blue-200">
+                <UserCheck className="w-3.5 h-3.5 text-blue-600" />
+                <span>Private Auditor View ({currentUser?.email})</span>
+              </span>
+            )}
           </div>
           <p className="text-xs sm:text-sm text-slate-500">
-            Access past factory technical assessments, export official PDF reports, or delete records from Firebase to prevent storage accumulation.
+            {isAdmin
+              ? 'Access all factory technical assessments, open/close CAP items, export Audit or CAP PDF reports, or manage cloud records.'
+              : 'Reopen factories you audited to open CAP items, upload closure evidence, close CAPs, and download Audit or CAP PDF reports. Other auditors’ reports remain strictly private.'}
           </p>
         </div>
 
@@ -109,16 +91,16 @@ export const SavedAuditsView: React.FC<Props> = ({
       {audits.length === 0 ? (
         <div className="bg-white rounded-2xl p-12 text-center border border-slate-200 shadow-sm">
           <FileText className="w-12 h-12 text-slate-300 mx-auto mb-3" />
-          <h3 className="text-base font-bold text-slate-800">No Saved Audits Found</h3>
+          <h3 className="text-base font-bold text-slate-800">No Submitted Audits Found</h3>
           <p className="text-xs text-slate-500 max-w-sm mx-auto mt-1">
-            Complete the pre-audit setup and section checkpoints, then click &quot;Submit &amp; Generate Report&quot; to archive reports here in Firebase Firestore.
+            Complete the Pre-Audit setup and Checkpoints, then click &quot;Submit Audit&quot; to archive your factory report and manage its CAP here.
           </p>
           <button
             type="button"
             onClick={onStartNewAudit}
             className="mt-4 px-4 py-2 rounded-xl bg-blue-600 text-white text-xs font-bold cursor-pointer"
           >
-            Start First Audit
+            Start Factory Audit
           </button>
         </div>
       ) : (
@@ -132,6 +114,10 @@ export const SavedAuditsView: React.FC<Props> = ({
                 ? 'text-amber-600'
                 : 'text-red-600';
 
+            const capList = buildCapItemsFromReport(audit);
+            const capClosedCount = capList.filter((c) => c.status === 'closed').length;
+            const capOpenCount = capList.length - capClosedCount;
+
             return (
               <div
                 key={audit.id}
@@ -140,14 +126,25 @@ export const SavedAuditsView: React.FC<Props> = ({
                 <div className="space-y-3">
                   <div className="flex items-start justify-between gap-2">
                     <div>
-                      <div className="flex items-center gap-1.5">
+                      <div className="flex flex-wrap items-center gap-1.5">
                         <span className="px-2 py-0.5 rounded text-[10px] font-mono font-bold bg-slate-100 text-slate-700">
-                          {audit.id}
+                          {audit.factoryInfo?.auditReportNo || audit.id}
                         </span>
                         <span className="flex items-center gap-0.5 text-[9px] text-emerald-600 font-semibold">
                           <Cloud className="w-3 h-3" />
-                          <span>Cloud Synced</span>
+                          <span>Synced</span>
                         </span>
+                        {capList.length > 0 && (
+                          <span
+                            className={`px-2 py-0.5 rounded text-[10px] font-bold ${
+                              capOpenCount > 0
+                                ? 'bg-amber-100 text-amber-800'
+                                : 'bg-emerald-100 text-emerald-800'
+                            }`}
+                          >
+                            CAP: {capClosedCount}/{capList.length} Closed
+                          </span>
+                        )}
                       </div>
                       <h3 className="text-base font-bold text-slate-900 mt-1">
                         {audit.factoryInfo?.name || 'Factory'}
@@ -186,73 +183,101 @@ export const SavedAuditsView: React.FC<Props> = ({
                   {/* Summary counts */}
                   <div className="grid grid-cols-4 gap-1.5 py-2 px-3 bg-slate-50 rounded-xl text-center text-xs">
                     <div>
-                      <span className="text-[10px] text-slate-400 block font-semibold">Critical</span>
+                      <span className="text-[10px] text-slate-400 block font-semibold">Not Acc.</span>
                       <strong className="text-red-600 font-bold">{audit.totalCritical || 0}</strong>
                     </div>
                     <div>
-                      <span className="text-[10px] text-slate-400 block font-semibold">Major</span>
-                      <strong className="text-yellow-700 font-bold">{audit.totalMajor || 0}</strong>
+                      <span className="text-[10px] text-slate-400 block font-semibold">Below Exp.</span>
+                      <strong className="text-amber-700 font-bold">{audit.totalMajor || 0}</strong>
                     </div>
                     <div>
-                      <span className="text-[10px] text-slate-400 block font-semibold">Minor</span>
-                      <strong className="text-amber-700 font-bold">{audit.totalMinor || 0}</strong>
+                      <span className="text-[10px] text-slate-400 block font-semibold">Acceptable</span>
+                      <strong className="text-blue-700 font-bold">{audit.totalMinor || 0}</strong>
                     </div>
                     <div>
-                      <span className="text-[10px] text-slate-400 block font-semibold">No Issue</span>
+                      <span className="text-[10px] text-slate-400 block font-semibold">Good</span>
                       <strong className="text-emerald-700 font-bold">{audit.totalNoIssue || 0}</strong>
                     </div>
                   </div>
                 </div>
 
                 {/* Card actions */}
-                <div className="flex items-center justify-between gap-2 pt-4 mt-4 border-t border-slate-100 text-xs">
-                  {confirmDeleteId === audit.id ? (
-                    <div className="flex items-center gap-1.5 animate-in fade-in">
+                <div className="flex flex-wrap items-center justify-between gap-2 pt-4 mt-4 border-t border-slate-100 text-xs">
+                  {isAdmin ? (
+                    confirmDeleteId === audit.id ? (
+                      <div className="flex items-center gap-1.5 animate-in fade-in">
+                        <button
+                          type="button"
+                          disabled={isDeleting}
+                          onClick={() => handleDelete(audit.id)}
+                          className="px-2.5 py-1 text-xs font-bold rounded-lg bg-red-600 hover:bg-red-700 text-white shadow-xs transition-colors cursor-pointer disabled:opacity-50"
+                        >
+                          {isDeleting ? 'Deleting...' : 'Confirm Delete?'}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setConfirmDeleteId(null)}
+                          className="px-2 py-1 text-xs font-medium rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-600 transition-colors cursor-pointer"
+                        >
+                          Cancel
+                        </button>
+                      </div>
+                    ) : (
                       <button
                         type="button"
-                        disabled={isDeleting}
-                        onClick={() => handleDelete(audit.id)}
-                        className="px-2.5 py-1 text-xs font-bold rounded-lg bg-red-600 hover:bg-red-700 text-white shadow-xs transition-colors cursor-pointer disabled:opacity-50"
+                        onClick={() => setConfirmDeleteId(audit.id)}
+                        className="px-2 py-1.5 text-slate-500 hover:text-red-600 hover:bg-red-50 rounded-lg transition-colors cursor-pointer flex items-center gap-1 border border-transparent hover:border-red-200"
+                        title="Delete saved audit from Firebase"
                       >
-                        {isDeleting ? 'Deleting...' : 'Delete Cloud Record?'}
+                        <Trash2 className="w-3.5 h-3.5" />
+                        <span className="text-[11px] font-semibold">Delete</span>
                       </button>
-                      <button
-                        type="button"
-                        onClick={() => setConfirmDeleteId(null)}
-                        className="px-2 py-1 text-xs font-medium rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-600 transition-colors cursor-pointer"
-                      >
-                        Cancel
-                      </button>
-                    </div>
+                    )
                   ) : (
-                    <button
-                      type="button"
-                      onClick={() => setConfirmDeleteId(audit.id)}
-                      className="px-2 py-1.5 text-slate-500 hover:text-red-600 hover:bg-red-50 rounded-lg transition-colors cursor-pointer flex items-center gap-1 border border-transparent hover:border-red-200"
-                      title="Delete saved audit from Firebase"
-                    >
-                      <Trash2 className="w-3.5 h-3.5" />
-                      <span className="text-[11px] font-semibold">Delete</span>
-                    </button>
+                    <span className="text-[11px] text-slate-400 font-medium">
+                      Submitted Audit
+                    </span>
                   )}
 
-                  <div className="flex items-center gap-2">
+                  <div className="flex flex-wrap items-center gap-1.5">
                     <button
                       type="button"
                       onClick={() => generateAuditPdf(audit)}
-                      className="px-3 py-1.5 rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-700 font-semibold flex items-center gap-1.5 transition-colors cursor-pointer"
-                      title="Download PDF"
+                      className="px-2.5 py-1.5 rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-700 font-semibold flex items-center gap-1 transition-colors cursor-pointer"
+                      title="Download Audit PDF"
                     >
                       <Download className="w-3.5 h-3.5" />
                       <span>PDF</span>
                     </button>
 
+                    {capList.length > 0 && (
+                      <button
+                        type="button"
+                        onClick={() => generateCapPdf(audit, capList)}
+                        className="px-2.5 py-1.5 rounded-lg bg-teal-50 hover:bg-teal-100 text-teal-800 border border-teal-200 font-semibold flex items-center gap-1 transition-colors cursor-pointer"
+                        title="Download CAP PDF Report"
+                      >
+                        <Download className="w-3.5 h-3.5" />
+                        <span>CAP PDF</span>
+                      </button>
+                    )}
+
+                    <button
+                      type="button"
+                      onClick={() => onOpenCap(audit)}
+                      className="px-3 py-1.5 rounded-lg bg-amber-500 hover:bg-amber-600 text-slate-950 font-bold flex items-center gap-1 transition-colors cursor-pointer"
+                      title="Open & Close Corrective Action Plan (CAP)"
+                    >
+                      <ClipboardCheck className="w-3.5 h-3.5" />
+                      <span>Open CAP</span>
+                    </button>
+
                     <button
                       type="button"
                       onClick={() => onLoadAudit(audit)}
-                      className="px-3.5 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-700 text-white font-bold flex items-center gap-1.5 transition-colors cursor-pointer"
+                      className="px-3 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-700 text-white font-bold flex items-center gap-1 transition-colors cursor-pointer"
                     >
-                      <span>Open Report</span>
+                      <span>Report</span>
                       <ArrowRight className="w-3.5 h-3.5" />
                     </button>
                   </div>

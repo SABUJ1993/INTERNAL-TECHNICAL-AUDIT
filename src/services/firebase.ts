@@ -51,7 +51,7 @@ try {
 export const storage = storageInstance;
 
 const DRAFT_COLLECTION = 'active_drafts';
-const DRAFT_DOC_ID = 'global_active_draft';
+const DEFAULT_DRAFT_DOC_ID = 'global_active_draft';
 const AUDITS_COLLECTION = 'audit_reports';
 const USERS_COLLECTION = 'auditor_users';
 const RESET_OTP_COLLECTION = 'password_reset_otps';
@@ -61,6 +61,11 @@ export const ADMIN_EMAIL = 'quality.bd.eng@gmail.com';
 export function isAuditorAdmin(email?: string | null): boolean {
   if (!email) return false;
   return email.trim().toLowerCase() === ADMIN_EMAIL.toLowerCase();
+}
+
+function getDraftDocId(userEmail?: string | null): string {
+  if (!userEmail || !userEmail.trim()) return DEFAULT_DRAFT_DOC_ID;
+  return `draft_${userEmail.trim().toLowerCase().replace(/[^a-z0-9]/g, '_')}`;
 }
 
 /**
@@ -85,12 +90,16 @@ export async function uploadPhotoToFirebaseStorage(
 }
 
 /**
- * Real-time Firestore sync for active audit draft
+ * Real-time Firestore sync for active audit draft (scoped per user email)
  */
-export async function syncDraftToFirestore(draft: any, clientId?: string): Promise<void> {
+export async function syncDraftToFirestore(
+  draft: any,
+  clientId?: string,
+  userEmail?: string | null
+): Promise<void> {
   if (!db) return;
   try {
-    const docRef = doc(db, DRAFT_COLLECTION, DRAFT_DOC_ID);
+    const docRef = doc(db, DRAFT_COLLECTION, getDraftDocId(userEmail));
     if (!draft) {
       await deleteDoc(docRef);
       return;
@@ -98,6 +107,7 @@ export async function syncDraftToFirestore(draft: any, clientId?: string): Promi
 
     let cleanDraft = {
       ...draft,
+      ownerEmail: userEmail ? userEmail.trim().toLowerCase() : draft.ownerEmail || null,
       senderClientId: clientId || null,
       updatedAt: new Date().toISOString(),
     };
@@ -113,6 +123,14 @@ export async function syncDraftToFirestore(draft: any, clientId?: string): Promi
             openingMeetingPhoto: cleanDraft.factoryInfo?.openingMeetingPhoto?.startsWith('http')
               ? cleanDraft.factoryInfo.openingMeetingPhoto
               : (cleanDraft.factoryInfo?.openingMeetingPhoto ? 'image-attached' : undefined),
+            factoryOutlookPhotos: cleanDraft.factoryInfo?.factoryOutlookPhotos?.map((img: any) => ({
+              id: img.id,
+              caption: img.caption,
+              timestamp: img.timestamp,
+              isConfirmed: img.isConfirmed,
+              aspectRatio: img.aspectRatio,
+              dataUrl: img.dataUrl?.startsWith('http') ? img.dataUrl : (img.dataUrl ? 'image-attached' : ''),
+            })),
           },
           sections: cleanDraft.sections?.map((sec: any) => ({
             ...sec,
@@ -123,6 +141,7 @@ export async function syncDraftToFirestore(draft: any, clientId?: string): Promi
                 caption: img.caption,
                 timestamp: img.timestamp,
                 isConfirmed: img.isConfirmed,
+                aspectRatio: img.aspectRatio,
                 dataUrl: img.dataUrl?.startsWith('http') ? img.dataUrl : (img.dataUrl ? 'image-attached' : ''),
               })),
             })),
@@ -138,15 +157,16 @@ export async function syncDraftToFirestore(draft: any, clientId?: string): Promi
 }
 
 /**
- * Subscribes to real-time Firestore updates across Mobile APK and PC Browser
+ * Subscribes to real-time Firestore updates across Mobile APK and PC Browser for this auditor
  */
 export function subscribeToFirestoreDraft(
   onUpdate: (draft: any) => void,
-  currentClientId?: string
+  currentClientId?: string,
+  userEmail?: string | null
 ): Unsubscribe {
   if (!db) return () => {};
   try {
-    const docRef = doc(db, DRAFT_COLLECTION, DRAFT_DOC_ID);
+    const docRef = doc(db, DRAFT_COLLECTION, getDraftDocId(userEmail));
     return onSnapshot(
       docRef,
       (snapshot) => {
@@ -176,10 +196,10 @@ export function subscribeToFirestoreDraft(
 /**
  * Clears the active draft in Firestore
  */
-export async function clearFirestoreDraft(): Promise<void> {
+export async function clearFirestoreDraft(userEmail?: string | null): Promise<void> {
   if (!db) return;
   try {
-    const docRef = doc(db, DRAFT_COLLECTION, DRAFT_DOC_ID);
+    const docRef = doc(db, DRAFT_COLLECTION, getDraftDocId(userEmail));
     await deleteDoc(docRef);
   } catch (err) {
     console.warn('Firestore clear draft error', err);
@@ -200,22 +220,26 @@ export async function saveAuditToFirestore(report: AuditReportData): Promise<voi
 }
 
 /**
- * Loads all saved audits from Firestore
- * Strictly restricted to Admin: quality.bd.eng@gmail.com
+ * Loads saved audits from Firestore:
+ * - Admin (quality.bd.eng@gmail.com) sees all reports
+ * - Other signed-in auditors ONLY see their own submitted reports (for CAP open/close)
  */
 export async function fetchAuditsFromFirestore(requesterEmail?: string): Promise<AuditReportData[]> {
-  if (!db) return [];
-  // Security guard: Only Admin can load saved audit archives
-  if (!isAuditorAdmin(requesterEmail)) {
-    console.warn('[SECURITY] Non-admin access to saved audits blocked.');
-    return [];
-  }
+  if (!db || !requesterEmail) return [];
+  const normalizedRequester = requesterEmail.trim().toLowerCase();
+  const adminAccess = isAuditorAdmin(normalizedRequester);
+
   try {
     const colRef = collection(db, AUDITS_COLLECTION);
     const snap = await getDocs(colRef);
     const audits: AuditReportData[] = [];
     snap.forEach((d) => {
-      audits.push(d.data() as AuditReportData);
+      const data = d.data() as AuditReportData;
+      if (adminAccess) {
+        audits.push(data);
+      } else if (data.auditorEmail && data.auditorEmail.trim().toLowerCase() === normalizedRequester) {
+        audits.push(data);
+      }
     });
     return audits;
   } catch (err) {

@@ -18,6 +18,8 @@ import {
   Share2,
   Images,
   Camera,
+  ClipboardCheck,
+  Mail,
 } from 'lucide-react';
 import { AuditReportData, CheckpointEvidence, SCORE_DEFINITIONS } from '../types/audit';
 import { generateAuditPdf } from '../utils/pdfGenerator';
@@ -29,6 +31,8 @@ interface Props {
   onSaveReport: (report: AuditReportData) => Promise<void>;
   onOpenPreviewImage: (evidence: CheckpointEvidence) => void;
   onOpenShareModal?: () => void;
+  onOpenCap?: () => void;
+  onEmailReport?: () => void;
 }
 
 export const ReportView: React.FC<Props> = ({
@@ -37,6 +41,8 @@ export const ReportView: React.FC<Props> = ({
   onSaveReport,
   onOpenPreviewImage,
   onOpenShareModal,
+  onOpenCap,
+  onEmailReport,
 }) => {
   const [downloading, setDownloading] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -141,6 +147,30 @@ export const ReportView: React.FC<Props> = ({
             )}
             <span>{downloading ? 'Compiling PDF...' : 'Download PDF Report'}</span>
           </button>
+
+          {onOpenCap && (
+            <button
+              type="button"
+              onClick={onOpenCap}
+              className="px-4 py-2.5 rounded-xl bg-amber-500 hover:bg-amber-600 text-slate-950 font-extrabold text-xs sm:text-sm shadow-sm flex items-center gap-1.5 transition-all cursor-pointer"
+              title="Open & Close Corrective Action Plan (CAP)"
+            >
+              <ClipboardCheck className="w-4 h-4" />
+              <span>Open CAP</span>
+            </button>
+          )}
+
+          {onEmailReport && (
+            <button
+              type="button"
+              onClick={onEmailReport}
+              className="px-3.5 py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold flex items-center gap-1.5 transition-colors cursor-pointer"
+              title="Send PDF Report to Contact Email(s)"
+            >
+              <Mail className="w-4 h-4" />
+              <span>Email PDF</span>
+            </button>
+          )}
 
           <button
             type="button"
@@ -490,11 +520,13 @@ export const ReportView: React.FC<Props> = ({
                   </span>
                 </div>
               )}
-              {report.factoryInfo.contactEmail && (
-                <div className="p-3 bg-slate-50 rounded-xl border border-slate-200">
-                  <span className="text-[10px] font-bold uppercase text-slate-400 block">Contact Email</span>
-                  <span className="font-bold text-slate-900">
-                    {report.factoryInfo.contactEmail}
+              {(report.factoryInfo.contactEmail || (report.factoryInfo.contactEmails && report.factoryInfo.contactEmails.length > 0)) && (
+                <div className="p-3 bg-slate-50 rounded-xl border border-slate-200 sm:col-span-2">
+                  <span className="text-[10px] font-bold uppercase text-slate-400 block">Contact Email(s)</span>
+                  <span className="font-bold text-slate-900 break-all">
+                    {report.factoryInfo.contactEmails && report.factoryInfo.contactEmails.length > 0
+                      ? report.factoryInfo.contactEmails.join(', ')
+                      : report.factoryInfo.contactEmail}
                   </span>
                 </div>
               )}

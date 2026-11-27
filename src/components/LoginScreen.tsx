@@ -91,7 +91,7 @@ export const LoginScreen: React.FC<Props> = ({ onLoginSuccess }) => {
     }
 
     if (!isValidEmail(loginEmail)) {
-      setError('Please enter a valid email address (e.g. quality.bd.eng@gmail.com).');
+      setError('Please enter a valid email address (e.g. user@mail.com).');
       return;
     }
 
@@ -420,7 +420,7 @@ export const LoginScreen: React.FC<Props> = ({ onLoginSuccess }) => {
                     type="email"
                     value={loginEmail}
                     onChange={(e) => setLoginEmail(e.target.value)}
-                    placeholder="quality.bd.eng@gmail.com"
+                    placeholder="user@mail.com"
                     className="w-full pl-9 pr-3 py-2.5 bg-slate-50 border border-slate-300 rounded-xl text-xs sm:text-sm text-slate-900 placeholder-slate-400 focus:bg-white focus:outline-none focus:ring-2 focus:ring-blue-100 focus:border-blue-600 transition-all font-mono"
                     required
                     autoFocus
@@ -555,7 +555,7 @@ export const LoginScreen: React.FC<Props> = ({ onLoginSuccess }) => {
                         type="email"
                         value={forgotEmail}
                         onChange={(e) => setForgotEmail(e.target.value)}
-                        placeholder="e.g. quality.bd.eng@gmail.com"
+                        placeholder="e.g. user@mail.com"
                         className="w-full pl-9 pr-3 py-2 bg-slate-50 border border-slate-300 rounded-xl text-xs sm:text-sm text-slate-900 focus:bg-white focus:outline-none focus:ring-2 focus:ring-blue-100 focus:border-blue-600 font-mono"
                         required
                         autoFocus
