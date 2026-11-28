@@ -10,6 +10,7 @@ import {
   ClipboardCheck,
   ShieldCheck,
   UserCheck,
+  Send,
 } from 'lucide-react';
 import { AppTab, AuditorUser, ViewMode, AuditSection, CheckpointItem } from '../types/audit';
 import { isAuditorAdmin } from '../services/firebase';
@@ -38,6 +39,7 @@ interface Props {
   openCapCount?: number;
   totalCapCount?: number;
   liveDraftCount?: number;
+  onSubmitAudit?: () => void;
 }
 
 export const Header: React.FC<Props> = ({
@@ -62,6 +64,7 @@ export const Header: React.FC<Props> = ({
   openCapCount = 0,
   totalCapCount = 0,
   liveDraftCount = 0,
+  onSubmitAudit,
 }) => {
   const completionPercent = totalCheckpoints > 0 ? Math.round((evaluatedCount / totalCheckpoints) * 100) : 0;
 
@@ -262,96 +265,110 @@ export const Header: React.FC<Props> = ({
         </div>
       )}
 
-      {/* Main Tab Bar Navigation: Royal Blue sub-bar with crisp active white pills */}
+      {/* Main Tab Bar Navigation: Royal Blue sub-bar with crisp active white pills + Submit Audit at far right */}
       <div className="bg-blue-900/90 border-t border-blue-500/30 px-3 sm:px-6 lg:px-8 xl:px-10">
-        <div className="max-w-[1720px] mx-auto flex items-center gap-2 overflow-x-auto py-2 no-scrollbar text-xs">
-          <button
-            onClick={() => onTabChange('pre-audit')}
-            className={`px-3 py-1.5 rounded-lg text-xs font-bold flex items-center gap-1.5 transition-all cursor-pointer whitespace-nowrap ${
-              currentTab === 'pre-audit'
-                ? 'bg-white text-blue-800 shadow-sm'
-                : 'text-blue-100 hover:bg-blue-800/80 hover:text-white'
-            }`}
-          >
-            <Building2 className="w-4 h-4" />
-            <span>1. Pre-Audit</span>
-          </button>
-
-          <button
-            onClick={() => onTabChange('audit')}
-            className={`px-3 py-1.5 rounded-lg text-xs font-bold flex items-center gap-1.5 transition-all cursor-pointer whitespace-nowrap ${
-              currentTab === 'audit'
-                ? 'bg-white text-blue-800 shadow-sm'
-                : 'text-blue-100 hover:bg-blue-800/80 hover:text-white'
-            }`}
-          >
-            <CheckSquare className="w-4 h-4" />
-            <span>2. Checkpoints</span>
-            <span
-              className={`px-1.5 py-0.2 rounded-full text-[10px] font-bold ${
-                currentTab === 'audit' ? 'bg-blue-100 text-blue-800' : 'bg-blue-950/60 text-blue-100'
+        <div className="max-w-[1720px] mx-auto flex items-center justify-between gap-2 py-2 text-xs">
+          <div className="flex items-center gap-2 overflow-x-auto no-scrollbar min-w-0 flex-1">
+            <button
+              onClick={() => onTabChange('pre-audit')}
+              className={`px-3 py-1.5 rounded-lg text-xs font-bold flex items-center gap-1.5 transition-all cursor-pointer whitespace-nowrap ${
+                currentTab === 'pre-audit'
+                  ? 'bg-white text-blue-800 shadow-sm'
+                  : 'text-blue-100 hover:bg-blue-800/80 hover:text-white'
               }`}
             >
-              {evaluatedCount}/{totalCheckpoints}
-            </span>
-          </button>
+              <Building2 className="w-4 h-4" />
+              <span>1. Pre-Audit</span>
+            </button>
 
-          <button
-            onClick={() => onTabChange('report')}
-            className={`px-3 py-1.5 rounded-lg text-xs font-bold flex items-center gap-1.5 transition-all cursor-pointer whitespace-nowrap ${
-              currentTab === 'report'
-                ? 'bg-white text-blue-800 shadow-sm'
-                : 'text-blue-100 hover:bg-blue-800/80 hover:text-white'
-            }`}
-          >
-            <FileText className="w-4 h-4" />
-            <span>3. Report &amp; PDF</span>
-            {evaluatedCount > 0 && (
-              <span className={`px-1.5 py-0.2 rounded-full text-[10px] font-bold ${badgeBg}`}>
-                {currentPercentage}%
-              </span>
-            )}
-          </button>
-
-          <button
-            onClick={() => onTabChange('cap')}
-            className={`px-3 py-1.5 rounded-lg text-xs font-bold flex items-center gap-1.5 transition-all cursor-pointer whitespace-nowrap ${
-              currentTab === 'cap'
-                ? 'bg-white text-blue-800 shadow-sm'
-                : 'text-blue-100 hover:bg-blue-800/80 hover:text-white'
-            }`}
-          >
-            <ClipboardCheck className="w-4 h-4" />
-            <span>4. CAP</span>
-            {totalCapCount > 0 && (
+            <button
+              onClick={() => onTabChange('audit')}
+              className={`px-3 py-1.5 rounded-lg text-xs font-bold flex items-center gap-1.5 transition-all cursor-pointer whitespace-nowrap ${
+                currentTab === 'audit'
+                  ? 'bg-white text-blue-800 shadow-sm'
+                  : 'text-blue-100 hover:bg-blue-800/80 hover:text-white'
+              }`}
+            >
+              <CheckSquare className="w-4 h-4" />
+              <span>2. Checkpoints</span>
               <span
                 className={`px-1.5 py-0.2 rounded-full text-[10px] font-bold ${
-                  openCapCount > 0
-                    ? 'bg-amber-400 text-slate-950'
-                    : 'bg-emerald-500 text-white'
+                  currentTab === 'audit' ? 'bg-blue-100 text-blue-800' : 'bg-blue-950/60 text-blue-100'
                 }`}
               >
-                {openCapCount > 0 ? `${openCapCount} Open` : 'Closed'}
+                {evaluatedCount}/{totalCheckpoints}
               </span>
-            )}
-          </button>
+            </button>
 
-          <button
-            onClick={() => onTabChange('saved-audits')}
-            className={`px-3 py-1.5 rounded-lg text-xs font-bold flex items-center gap-1.5 transition-all cursor-pointer whitespace-nowrap ${
-              currentTab === 'saved-audits'
-                ? 'bg-white text-blue-800 shadow-sm'
-                : 'text-blue-100 hover:bg-blue-800/80 hover:text-white'
-            }`}
-          >
-            <History className="w-4 h-4 text-emerald-300" />
-            <span>{isAdmin ? 'Saved Records (Admin)' : 'My Audits & CAP'}</span>
-            {isAdmin && liveDraftCount > 0 && (
-              <span className="px-1.5 py-0.2 rounded-full text-[10px] font-extrabold bg-emerald-400 text-slate-950 animate-pulse">
-                {liveDraftCount} Live
-              </span>
-            )}
-          </button>
+            <button
+              onClick={() => onTabChange('report')}
+              className={`px-3 py-1.5 rounded-lg text-xs font-bold flex items-center gap-1.5 transition-all cursor-pointer whitespace-nowrap ${
+                currentTab === 'report'
+                  ? 'bg-white text-blue-800 shadow-sm'
+                  : 'text-blue-100 hover:bg-blue-800/80 hover:text-white'
+              }`}
+            >
+              <FileText className="w-4 h-4" />
+              <span>3. Report &amp; PDF</span>
+              {evaluatedCount > 0 && (
+                <span className={`px-1.5 py-0.2 rounded-full text-[10px] font-bold ${badgeBg}`}>
+                  {currentPercentage}%
+                </span>
+              )}
+            </button>
+
+            <button
+              onClick={() => onTabChange('cap')}
+              className={`px-3 py-1.5 rounded-lg text-xs font-bold flex items-center gap-1.5 transition-all cursor-pointer whitespace-nowrap ${
+                currentTab === 'cap'
+                  ? 'bg-white text-blue-800 shadow-sm'
+                  : 'text-blue-100 hover:bg-blue-800/80 hover:text-white'
+              }`}
+            >
+              <ClipboardCheck className="w-4 h-4" />
+              <span>4. CAP</span>
+              {totalCapCount > 0 && (
+                <span
+                  className={`px-1.5 py-0.2 rounded-full text-[10px] font-bold ${
+                    openCapCount > 0
+                      ? 'bg-amber-400 text-slate-950'
+                      : 'bg-emerald-500 text-white'
+                  }`}
+                >
+                  {openCapCount > 0 ? `${openCapCount} Open` : 'Closed'}
+                </span>
+              )}
+            </button>
+
+            <button
+              onClick={() => onTabChange('saved-audits')}
+              className={`px-3 py-1.5 rounded-lg text-xs font-bold flex items-center gap-1.5 transition-all cursor-pointer whitespace-nowrap ${
+                currentTab === 'saved-audits'
+                  ? 'bg-white text-blue-800 shadow-sm'
+                  : 'text-blue-100 hover:bg-blue-800/80 hover:text-white'
+              }`}
+            >
+              <History className="w-4 h-4 text-emerald-300" />
+              <span>{isAdmin ? 'Saved Records (Admin)' : 'My Audits & CAP'}</span>
+              {isAdmin && liveDraftCount > 0 && (
+                <span className="px-1.5 py-0.2 rounded-full text-[10px] font-extrabold bg-emerald-400 text-slate-950 animate-pulse">
+                  {liveDraftCount} Live
+                </span>
+              )}
+            </button>
+          </div>
+
+          {onSubmitAudit && (
+            <button
+              type="button"
+              onClick={onSubmitAudit}
+              title="Submit Audit & Generate Final Report"
+              className="px-3 sm:px-4 py-1.5 rounded-lg bg-gradient-to-r from-emerald-400 to-teal-400 hover:from-emerald-300 hover:to-teal-300 text-slate-950 font-extrabold text-xs shadow-md shadow-emerald-950/30 flex items-center gap-1.5 transition-all cursor-pointer whitespace-nowrap shrink-0 border border-emerald-200/80"
+            >
+              <Send className="w-3.5 h-3.5" />
+              <span>Submit Audit</span>
+            </button>
+          )}
         </div>
       </div>
 

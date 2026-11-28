@@ -61,10 +61,10 @@ export const EvidencePhotoThumbnail: React.FC<EvidencePhotoThumbnailProps> = ({
 
   return (
     <div
-      className={`relative group rounded-xl overflow-hidden border border-slate-300 bg-slate-900 shadow-xs flex flex-col justify-between shrink-0 transition-all duration-200 hover:shadow-md ${heightClass} ${className}`}
+      className={`relative group rounded-xl overflow-hidden border border-slate-300 bg-slate-900 shadow-xs flex flex-col justify-between shrink-0 max-w-full transition-all duration-200 hover:shadow-md ${heightClass} ${className}`}
       style={{
         aspectRatio: aspectRatio ? `${aspectRatio}` : undefined,
-        minWidth: isPortrait ? '120px' : isLandscape ? '190px' : '150px',
+        minWidth: isPortrait ? '115px' : isLandscape ? '160px' : '140px',
         maxWidth: isPortrait ? '170px' : isLandscape ? '280px' : '220px',
       }}
     >

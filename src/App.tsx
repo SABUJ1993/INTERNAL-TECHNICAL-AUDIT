@@ -1008,12 +1008,45 @@ export default function App() {
     }
   };
 
+  const handleSaveDraft = async () => {
+    const ownerEmail = currentUser?.email?.trim().toLowerCase() || '';
+    lastLocalEditTsRef.current = Date.now();
+    setSyncMessage('Saving Draft...');
+    if (syncTimeoutRef.current) clearTimeout(syncTimeoutRef.current);
+
+    try {
+      if (!editingReportIdRef.current) {
+        const res = await saveActiveDraftImmediate(
+          {
+            ownerEmail,
+            factoryInfo: latestDraftRef.current.factoryInfo,
+            sections: latestDraftRef.current.sections,
+            currentTab: latestDraftRef.current.currentTab,
+            activeSectionId: latestDraftRef.current.activeSectionId,
+          },
+          ownerEmail
+        );
+        setIsSaved(true);
+        setSyncMessage(res.ok ? 'Draft Saved & Live Synced' : 'Draft Saved Locally');
+      } else if (!editingReportIdRef.current.startsWith('LIVE-')) {
+        await handleSaveReportDirect(activeReportData);
+      }
+    } finally {
+      syncTimeoutRef.current = setTimeout(() => {
+        setSyncMessage('Live Synced');
+      }, 2500);
+    }
+  };
+
   const handleSubmitAndGenerateReport = async () => {
+    const isLiveStreamId = currentReport?.id?.startsWith('LIVE-');
+    const targetReportId = isLiveStreamId ? undefined : currentReport?.id;
+    const targetCreatedAt = isLiveStreamId ? undefined : currentReport?.createdAt;
     const baseReport = calculateAuditReport(
       factoryInfo,
       sections,
-      currentReport?.id,
-      currentReport?.createdAt
+      targetReportId,
+      targetCreatedAt
     );
     const derivedCaps = buildCapItemsFromReport({
       ...baseReport,
@@ -1528,6 +1561,7 @@ export default function App() {
         openCapCount={openCapCount}
         totalCapCount={activeCapItems.length}
         liveDraftCount={adminLiveDrafts.length}
+        onSubmitAudit={handleSubmitAndGenerateReport}
       />
 
       {/* Main Tab Content */}
@@ -1588,6 +1622,7 @@ export default function App() {
             sections={sections}
             onUpdateSections={handleLocalSectionsChange}
             onSubmitAndGenerateReport={handleSubmitAndGenerateReport}
+            onSaveDraft={handleSaveDraft}
             onOpenPreviewImage={setActivePreviewImage}
             onOpenPhotoAction={handleOpenPhotoAction}
             onSyncCheckpoint={handleSyncCheckpoint}
