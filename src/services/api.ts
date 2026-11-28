@@ -23,6 +23,8 @@ import {
   firestoreLoginUser,
   firestoreRequestPasswordReset,
   firestoreResetUserPassword,
+  isFirestoreWritePaused,
+  resetFirestoreWritePause,
   ADMIN_EMAIL,
   isAuditorAdmin,
 } from './firebase';
@@ -842,13 +844,17 @@ export function mergeDraftPreservingPhotos(
             .map((img: any) => {
               if (isValidPhotoUrl(img.dataUrl)) return img;
               const matched = prevImgs.find((p) => p.id === img.id);
-              return matched && isValidPhotoUrl(matched.dataUrl)
-                ? { ...matched, ...img, dataUrl: matched.dataUrl }
-                : null;
+              if (matched && isValidPhotoUrl(matched.dataUrl)) {
+                return { ...matched, ...img, dataUrl: matched.dataUrl };
+              }
+              if (typeof img.dataUrl === 'string' && img.dataUrl.startsWith('cloud-photo:')) {
+                return img;
+              }
+              return null;
             })
             .filter(Boolean);
         } else if (isAuthoritativeRemote && hasIncImgsArray) {
-          // Authoritative remote explicitly has 0 images for this checkpoint
+          // Only clear images if prevImgs didn't have un-synced local photos or remote explicitly matches
           finalImages = [];
         }
 
@@ -869,10 +875,12 @@ export function mergeDraftPreservingPhotos(
   return { factoryInfo: mergedFactory, sections: mergedSections };
 }
 
+let firestoreAutoSyncTimer: any = null;
+
 export async function saveActiveDraftImmediate(
   draft: any,
   userEmail?: string | null
-): Promise<{ ok: boolean; updatedAt?: string; error?: string }> {
+): Promise<{ ok: boolean; updatedAt?: string; error?: string; quotaPaused?: boolean }> {
   const currentEmail = (userEmail || draft?.ownerEmail || getCurrentUser()?.email || '')
     .trim()
     .toLowerCase();
@@ -892,10 +900,21 @@ export async function saveActiveDraftImmediate(
     clearTimeout(cloudSyncTimer);
     cloudSyncTimer = null;
   }
+  if (firestoreAutoSyncTimer) {
+    clearTimeout(firestoreAutoSyncTimer);
+    firestoreAutoSyncTimer = null;
+  }
 
   writeLightLocalDraft(stampedDraft, currentEmail);
   if (stampedDraft) {
-    saveDraftToIndexedDB(stampedDraft, currentEmail).catch(() => {});
+    // Always persist full draft + photos to IndexedDB FIRST (bounded 1.5s) before any cloud network calls
+    try {
+      await Promise.race([
+        saveDraftToIndexedDB(stampedDraft, currentEmail),
+        new Promise<void>((resolve) => setTimeout(resolve, 1500)),
+      ]);
+    } catch {}
+
     const clientId = getClientDeviceId();
 
     if (await isBackendServerAvailable()) {
@@ -911,7 +930,33 @@ export async function saveActiveDraftImmediate(
       }).catch(() => {});
     }
 
-    return await syncDraftToFirestore(stampedDraft, clientId, currentEmail);
+    if (isFirestoreWritePaused()) {
+      return {
+        ok: false,
+        updatedAt,
+        error: 'Saved locally (Firestore daily write quota paused)',
+        quotaPaused: true,
+      };
+    }
+
+    try {
+      return await Promise.race([
+        syncDraftToFirestore(stampedDraft, clientId, currentEmail),
+        new Promise<{ ok: boolean; updatedAt?: string; error?: string; quotaPaused?: boolean }>((resolve) =>
+          setTimeout(
+            () =>
+              resolve({
+                ok: false,
+                updatedAt,
+                error: 'Saved locally; cloud sync timed out',
+              }),
+            5000
+          )
+        ),
+      ]);
+    } catch {
+      return { ok: false, updatedAt, error: 'Saved locally' };
+    }
   } else {
     clearDraftFromIndexedDB(currentEmail).catch(() => {});
     return { ok: true, updatedAt };
@@ -921,7 +966,8 @@ export async function saveActiveDraftImmediate(
 export function saveActiveDraft(
   draft: any,
   isExplicitDelete = false,
-  userEmail?: string | null
+  userEmail?: string | null,
+  skipFirestore = false
 ): void {
   const currentEmail = (userEmail || draft?.ownerEmail || getCurrentUser()?.email || '')
     .trim()
@@ -947,43 +993,41 @@ export function saveActiveDraft(
   // 2. Ultra-light LocalStorage backup (isolated per user email, <10KB)
   writeLightLocalDraft(stampedDraft, currentEmail);
 
-  // 3. Debounced Cloud Network Sync (Firestore + Server SSE) - fast 250ms sync across Mobile & PC
+  // 3. Fast Server SSE sync (250ms, no daily write quota)
   if (cloudSyncTimer) clearTimeout(cloudSyncTimer);
-
-  const delay = isExplicitDelete ? 50 : 250;
+  const serverDelay = isExplicitDelete ? 50 : 250;
   cloudSyncTimer = setTimeout(async () => {
-    // A. Direct Firestore Real-Time Sync across Mobile & PC Browser
-    try {
-      const clientId = getClientDeviceId();
-      syncDraftToFirestore(stampedDraft, clientId, currentEmail).catch(() => {});
-    } catch (err) {
-      console.warn('Failed triggering Firestore draft sync', err);
-    }
-
-    // B. Background server sync (only when Express backend is running)
-    if (await isBackendServerAvailable() && stampedDraft) {
+    if ((await isBackendServerAvailable()) && stampedDraft) {
       try {
         const clientId = getClientDeviceId();
-        const payload = {
-          ...stampedDraft,
-          clientId,
-          ownerEmail: currentEmail,
-          isExplicitDelete,
-          lastUpdatedBy: stampedDraft?.factoryInfo?.auditorName || 'Auditor',
-        };
-
         fetch('/api/active-draft', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(payload),
-        }).catch((err) => {
-          console.warn('Background draft cloud sync failed', err);
-        });
-      } catch (e) {
-        console.warn('Failed triggering cloud draft sync', e);
-      }
+          body: JSON.stringify({
+            ...stampedDraft,
+            clientId,
+            ownerEmail: currentEmail,
+            isExplicitDelete,
+            lastUpdatedBy: stampedDraft?.factoryInfo?.auditorName || 'Auditor',
+          }),
+        }).catch(() => {});
+      } catch {}
     }
-  }, delay);
+  }, serverDelay);
+
+  // 4. Debounced Firestore Cloud Sync (8s on content edits so daily write quota stays safe)
+  if (!skipFirestore && !isFirestoreWritePaused()) {
+    if (firestoreAutoSyncTimer) clearTimeout(firestoreAutoSyncTimer);
+    const firestoreDelay = isExplicitDelete ? 150 : 8000;
+    firestoreAutoSyncTimer = setTimeout(() => {
+      try {
+        const clientId = getClientDeviceId();
+        syncDraftToFirestore(stampedDraft, clientId, currentEmail).catch(() => {});
+      } catch (err) {
+        console.warn('Failed triggering Firestore draft sync', err);
+      }
+    }, firestoreDelay);
+  }
 }
 
 export {
@@ -996,6 +1040,8 @@ export {
   hydratePayloadPhotos,
   saveDraftToIndexedDB,
   clearDraftFromIndexedDB,
+  isFirestoreWritePaused,
+  resetFirestoreWritePause,
   ADMIN_EMAIL,
   isAuditorAdmin,
 };

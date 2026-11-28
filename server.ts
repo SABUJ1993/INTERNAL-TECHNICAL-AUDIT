@@ -163,6 +163,40 @@ app.get('/api/health', (req, res) => {
   });
 });
 
+const QUOTA_STATUS_FILE = path.join(DATA_DIR, 'firestore-quota.json');
+
+function readFirestoreQuotaStatus(): { pausedUntil: number } {
+  try {
+    if (fs.existsSync(QUOTA_STATUS_FILE)) {
+      const parsed = JSON.parse(fs.readFileSync(QUOTA_STATUS_FILE, 'utf-8'));
+      const pausedUntil = Number(parsed?.pausedUntil || 0);
+      if (Number.isFinite(pausedUntil)) {
+        return { pausedUntil };
+      }
+    }
+  } catch {}
+  return { pausedUntil: 0 };
+}
+
+app.get('/api/firestore-quota-status', (_req, res) => {
+  res.setHeader('Cache-Control', 'no-cache, no-store');
+  res.json(readFirestoreQuotaStatus());
+});
+
+app.post('/api/firestore-quota-status', (req, res) => {
+  try {
+    const incomingUntil = Number(req.body?.pausedUntil || 0);
+    const current = readFirestoreQuotaStatus();
+    const nextUntil = Number.isFinite(incomingUntil)
+      ? Math.max(current.pausedUntil, incomingUntil)
+      : current.pausedUntil;
+    fs.writeFileSync(QUOTA_STATUS_FILE, JSON.stringify({ pausedUntil: nextUntil }), 'utf-8');
+    return res.json({ pausedUntil: nextUntil });
+  } catch {
+    return res.json(readFirestoreQuotaStatus());
+  }
+});
+
 app.get(['/api/version', '/version.json'], (req, res) => {
   res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
   res.setHeader('Pragma', 'no-cache');

@@ -13,12 +13,14 @@ const CURRENT_APP_VERSION = typeof __APP_VERSION__ !== 'undefined' ? __APP_VERSI
 const CURRENT_APP_BUILD_TIME =
   typeof __APP_BUILD_TIME__ !== 'undefined' ? Number(__APP_BUILD_TIME__) : 1793784180000;
 
-export function useAppUpdate() {
+export function useAppUpdate(onBeforeReload?: () => Promise<void> | void) {
   const [updateAvailable, setUpdateAvailable] = useState(false);
   const [newVersion, setNewVersion] = useState<string>('Latest');
   const [isUpdating, setIsUpdating] = useState(false);
   const [dismissed, setDismissed] = useState(false);
   const checkInProgressRef = useRef(false);
+  const onBeforeReloadRef = useRef(onBeforeReload);
+  onBeforeReloadRef.current = onBeforeReload;
 
   // Store the version recorded when the app initially mounted
   const initialSessionVersionRef = useRef<string>(CURRENT_APP_VERSION);
@@ -65,10 +67,22 @@ export function useAppUpdate() {
     return false;
   }, []);
 
-  // Apply update immediately: clear outdated caches and hard-reload
+  // Apply update immediately: flush active draft & photos first, clear outdated SW caches (never IndexedDB/localStorage), then reload
   const applyUpdate = useCallback(async () => {
     try {
       setIsUpdating(true);
+
+      // 0. Guarantee active draft + all photos are safely flushed to IndexedDB / Cloud before reload
+      if (onBeforeReloadRef.current) {
+        try {
+          await Promise.race([
+            Promise.resolve(onBeforeReloadRef.current()),
+            new Promise((resolve) => setTimeout(resolve, 2500)),
+          ]);
+        } catch {
+          // continue reload
+        }
+      }
 
       // 1. Clear Service Worker registrations and caches
       if ('serviceWorker' in navigator) {

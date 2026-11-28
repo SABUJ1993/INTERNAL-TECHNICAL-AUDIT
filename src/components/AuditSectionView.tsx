@@ -524,8 +524,9 @@ export const AuditSectionView: React.FC<Props> = ({
                       <input
                         type="checkbox"
                         checked={Boolean(cp.isUpdated)}
+                        disabled={syncingCheckpointId === cp.id}
                         onChange={() => handleToggleCheckpointUpdate(cp.id)}
-                        className="w-3.5 h-3.5 rounded accent-emerald-600 cursor-pointer"
+                        className="w-3.5 h-3.5 rounded accent-emerald-600 cursor-pointer disabled:opacity-60"
                       />
                       <span>
                         {syncingCheckpointId === cp.id

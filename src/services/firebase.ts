@@ -2,6 +2,9 @@ import { initializeApp, getApps, getApp } from 'firebase/app';
 import {
   getFirestore,
   initializeFirestore,
+  disableNetwork,
+  enableNetwork,
+  terminate,
   doc,
   setDoc,
   getDoc,
@@ -72,7 +75,7 @@ try {
     console.warn('Firestore initialization fallback', err);
   }
 }
-export const db = firestoreInstance;
+export let db = firestoreInstance;
 
 /**
  * Recursively strips `undefined` properties from objects before Firestore writes
@@ -137,9 +140,205 @@ export function getDraftDocId(userEmail?: string | null): string {
   return `draft_${userEmail.trim().toLowerCase().replace(/[^a-z0-9]/g, '_')}`;
 }
 
-// In-memory cache of already uploaded / fetched photo keys to avoid redundant network writes/reads
-const syncedPhotoKeySet = new Set<string>();
+// In-memory + localStorage cache of already uploaded / fetched photo keys to avoid redundant network writes/reads
+const SYNCED_PHOTO_KEYS_STORAGE = 'ita_synced_photo_keys_v1';
+const syncedPhotoKeySet = new Set<string>((() => {
+  try {
+    if (typeof window !== 'undefined') {
+      const raw = localStorage.getItem(SYNCED_PHOTO_KEYS_STORAGE);
+      if (raw) return JSON.parse(raw);
+    }
+  } catch {}
+  return [];
+})());
 const fetchedPhotoDataCache = new Map<string, string>();
+
+function markPhotoKeySynced(photoKey: string) {
+  syncedPhotoKeySet.add(photoKey);
+  try {
+    if (typeof window !== 'undefined') {
+      const arr = Array.from(syncedPhotoKeySet).slice(-500);
+      localStorage.setItem(SYNCED_PHOTO_KEYS_STORAGE, JSON.stringify(arr));
+    }
+  } catch {}
+}
+
+const WRITE_PAUSE_STORAGE_KEY = 'ita_firestore_write_pause_until_v1';
+const LAST_SYNC_SIG_STORAGE_KEY = 'ita_firestore_last_sync_sig_v1';
+
+let firestoreWriteBackoffUntil = (() => {
+  try {
+    if (typeof window !== 'undefined') {
+      const raw = localStorage.getItem(WRITE_PAUSE_STORAGE_KEY);
+      if (raw) {
+        const parsed = Number(raw);
+        if (Number.isFinite(parsed)) return parsed;
+      }
+    }
+  } catch {}
+  return 0;
+})();
+
+let storageBucketAvailable = true;
+let firestoreNetworkPausedForQuota = false;
+
+const lastSyncedSigMap = new Map<string, string>((() => {
+  try {
+    if (typeof window !== 'undefined') {
+      const raw = localStorage.getItem(LAST_SYNC_SIG_STORAGE_KEY);
+      if (raw) return Object.entries(JSON.parse(raw));
+    }
+  } catch {}
+  return [];
+})());
+
+function saveLastSyncedSig(docId: string, sig: string) {
+  lastSyncedSigMap.set(docId, sig);
+  try {
+    if (typeof window !== 'undefined') {
+      const obj = Object.fromEntries(Array.from(lastSyncedSigMap.entries()).slice(-10));
+      localStorage.setItem(LAST_SYNC_SIG_STORAGE_KEY, JSON.stringify(obj));
+    }
+  } catch {}
+}
+
+function computeDraftContentSignature(draft: any): string {
+  if (!draft) return 'NULL';
+  try {
+    const f = draft.factoryInfo || {};
+    const secs = Array.isArray(draft.sections) ? draft.sections : [];
+    const lightSecs = secs.map((s: any) => ({
+      id: s.id,
+      cp: Array.isArray(s.checkpoints)
+        ? s.checkpoints.map((c: any) => ({
+            id: c.id,
+            sc: c.score ?? null,
+            nt: c.notes || '',
+            rq: c.requirement || '',
+            up: !!c.isUpdated,
+            im: Array.isArray(c.images)
+              ? c.images.map((i: any) => `${i.id}:${i.dataUrl?.length || 0}`)
+              : [],
+          }))
+        : [],
+    }));
+    const lightFactory = {
+      ...f,
+      openingMeetingPhoto: f.openingMeetingPhoto ? f.openingMeetingPhoto.length : 0,
+      factoryOutlookPhotos: Array.isArray(f.factoryOutlookPhotos)
+        ? f.factoryOutlookPhotos.map((p: any) => `${p.id}:${p.dataUrl?.length || 0}`)
+        : [],
+      certifications: Array.isArray(f.certifications)
+        ? f.certifications.map((c: any) => `${c.id}:${!!c.selected}:${c.photo?.length || 0}`)
+        : [],
+    };
+    return JSON.stringify({ f: lightFactory, s: lightSecs });
+  } catch {
+    return `${Date.now()}`;
+  }
+}
+
+let quotaHydrationPromise: Promise<void> | null = null;
+
+function initQuotaStatusFromServer(): Promise<void> {
+  if (typeof window === 'undefined') return Promise.resolve();
+  if (!quotaHydrationPromise) {
+    quotaHydrationPromise = fetch('/api/firestore-quota-status', { cache: 'no-store' })
+      .then((res) => (res.ok ? res.json() : null))
+      .then((data) => {
+        const serverPausedUntil = Number(data?.pausedUntil || 0);
+        if (Number.isFinite(serverPausedUntil) && serverPausedUntil > firestoreWriteBackoffUntil) {
+          firestoreWriteBackoffUntil = serverPausedUntil;
+          try {
+            localStorage.setItem(WRITE_PAUSE_STORAGE_KEY, String(serverPausedUntil));
+          } catch {}
+        }
+      })
+      .catch(() => {});
+  }
+  return quotaHydrationPromise;
+}
+
+if (typeof window !== 'undefined') {
+  initQuotaStatusFromServer();
+}
+
+async function ensureQuotaStatusHydrated(): Promise<void> {
+  try {
+    await Promise.race([
+      initQuotaStatusFromServer(),
+      new Promise<void>((resolve) => setTimeout(resolve, 400)),
+    ]);
+  } catch {}
+}
+
+export function isFirestoreWritePaused(): boolean {
+  return Date.now() < firestoreWriteBackoffUntil;
+}
+
+export function pauseFirestoreWrites(durationMs: number, terminateActiveStream = false): void {
+  const until = Date.now() + durationMs;
+  if (until > firestoreWriteBackoffUntil) {
+    firestoreWriteBackoffUntil = until;
+    try {
+      if (typeof window !== 'undefined') {
+        localStorage.setItem(WRITE_PAUSE_STORAGE_KEY, String(until));
+        fetch('/api/firestore-quota-status', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ pausedUntil: until }),
+        }).catch(() => {});
+      }
+    } catch {}
+  }
+  if (terminateActiveStream && db && !firestoreNetworkPausedForQuota) {
+    firestoreNetworkPausedForQuota = true;
+    const activeDb = db;
+    // Clear db reference and terminate instance so Firestore SDK WriteStream cannot log 60s retry errors
+    db = null;
+    disableNetwork(activeDb)
+      .catch(() => {})
+      .finally(() => {
+        terminate(activeDb).catch(() => {});
+      });
+  }
+}
+
+export async function resetFirestoreWritePause(): Promise<void> {
+  firestoreWriteBackoffUntil = 0;
+  try {
+    if (typeof window !== 'undefined') {
+      localStorage.removeItem(WRITE_PAUSE_STORAGE_KEY);
+    }
+  } catch {}
+  if (db && firestoreNetworkPausedForQuota) {
+    firestoreNetworkPausedForQuota = false;
+    try {
+      await enableNetwork(db);
+    } catch {}
+  }
+}
+
+function isQuotaError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err || '');
+  return (
+    msg.includes('resource-exhausted') ||
+    msg.includes('RESOURCE_EXHAUSTED') ||
+    msg.includes('Quota limit exceeded')
+  );
+}
+
+function isWriteTimeoutError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err || '');
+  return msg.toLowerCase().includes('timeout');
+}
+
+function withTimeout<T>(promise: Promise<T>, ms: number, label = 'Operation timed out'): Promise<T> {
+  return Promise.race([
+    promise,
+    new Promise<T>((_, reject) => setTimeout(() => reject(new Error(label)), ms)),
+  ]);
+}
 
 /**
  * Uploads a single photo dataUrl to Firestore `draft_photos/{photoKey}` (well within 1MB doc limit)
@@ -166,36 +365,54 @@ async function ensureCloudPhotoStored(
     return `${CLOUD_PHOTO_PREFIX}${photoKey}`;
   }
 
+  if (isFirestoreWritePaused()) {
+    return dataUrl;
+  }
+
   try {
     // Guard single photo size under 900KB
     if (dataUrl.length < 900000) {
       const photoRef = doc(db, DRAFT_PHOTOS_COLLECTION, photoKey);
-      await setDoc(
-        photoRef,
-        sanitizeForFirestore({
-          photoId: photoKey,
-          ownerEmail: ownerEmail ? ownerEmail.trim().toLowerCase() : null,
-          dataUrl,
-          updatedAt: new Date().toISOString(),
-        })
+      await withTimeout(
+        setDoc(
+          photoRef,
+          sanitizeForFirestore({
+            photoId: photoKey,
+            ownerEmail: ownerEmail ? ownerEmail.trim().toLowerCase() : null,
+            dataUrl,
+            updatedAt: new Date().toISOString(),
+          })
+        ),
+        3500,
+        'Cloud photo write timeout'
       );
-      syncedPhotoKeySet.add(photoKey);
+      markPhotoKeySynced(photoKey);
       return `${CLOUD_PHOTO_PREFIX}${photoKey}`;
     }
   } catch (err) {
+    if (isQuotaError(err)) {
+      pauseFirestoreWrites(4 * 60 * 60 * 1000, true);
+    } else if (isWriteTimeoutError(err) && (typeof navigator === 'undefined' || navigator.onLine !== false)) {
+      // Firestore SDK stalls queued writes indefinitely when daily quota is exhausted; pause & halt SDK write stream
+      pauseFirestoreWrites(4 * 60 * 60 * 1000, true);
+    }
     logFirestoreError(err, OperationType.WRITE, `${DRAFT_PHOTOS_COLLECTION}/${photoKey}`);
   }
 
-  // Optional Firebase Storage fallback if >900KB
-  if (storage) {
+  // Optional Firebase Storage fallback if >900KB (skip once 404 is detected)
+  if (storage && storageBucketAvailable) {
     try {
-      const url = await uploadPhotoToFirebaseStorage(photoKey, dataUrl);
+      const url = await withTimeout(
+        uploadPhotoToFirebaseStorage(photoKey, dataUrl),
+        3000,
+        'Storage upload timeout'
+      );
       if (url.startsWith('http')) {
-        syncedPhotoKeySet.add(photoKey);
+        markPhotoKeySynced(photoKey);
         return url;
       }
     } catch {
-      // ignore
+      storageBucketAvailable = false;
     }
   }
 
@@ -214,7 +431,7 @@ async function resolveCloudPhotoRef(url?: string): Promise<string | undefined> {
   if (!db) return url;
   try {
     const photoRef = doc(db, DRAFT_PHOTOS_COLLECTION, photoKey);
-    const snap = await getDoc(photoRef);
+    const snap = await withTimeout(getDoc(photoRef), 3500, 'Photo fetch timeout');
     if (snap.exists()) {
       const data = snap.data();
       if (data?.dataUrl && typeof data.dataUrl === 'string') {
@@ -433,7 +650,7 @@ export async function uploadPhotoToFirebaseStorage(
   photoId: string,
   dataUrl: string
 ): Promise<string> {
-  if (!storage || !dataUrl.startsWith('data:')) {
+  if (!storage || !storageBucketAvailable || !dataUrl.startsWith('data:')) {
     return dataUrl;
   }
   try {
@@ -441,7 +658,10 @@ export async function uploadPhotoToFirebaseStorage(
     await uploadString(photoRef, dataUrl, 'data_url');
     const downloadUrl = await getDownloadURL(photoRef);
     return downloadUrl;
-  } catch (err) {
+  } catch (err: any) {
+    if (err?.status_ === 404 || err?.code === 'storage/unknown') {
+      storageBucketAvailable = false;
+    }
     console.warn('Storage upload fallback to dataUrl', err);
     return dataUrl;
   }
@@ -455,28 +675,49 @@ export async function uploadPhotoToFirebaseStorage(
 export async function syncDraftToFirestore(
   draft: any,
   clientId?: string,
-  userEmail?: string | null
-): Promise<{ ok: boolean; updatedAt?: string; error?: string }> {
+  userEmail?: string | null,
+  forceWrite = false
+): Promise<{ ok: boolean; updatedAt?: string; error?: string; quotaPaused?: boolean }> {
+  await ensureQuotaStatusHydrated();
   if (!db) return { ok: false, error: 'Firestore not initialized' };
   const normalizedEmail = (userEmail || draft?.ownerEmail || '').trim().toLowerCase();
   if (!normalizedEmail) return { ok: false, error: 'Missing auditor email for cloud sync' };
+  if (isFirestoreWritePaused()) {
+    return {
+      ok: false,
+      error: 'Firestore daily write quota paused; saved locally',
+      quotaPaused: true,
+    };
+  }
   const docId = getDraftDocId(normalizedEmail);
   const path = `${DRAFT_COLLECTION}/${docId}`;
   const updatedAt = new Date().toISOString();
+
+  // Skip identical content writes to protect daily Firestore write quota
+  const contentSig = computeDraftContentSignature(draft);
+  if (!forceWrite && draft && lastSyncedSigMap.get(docId) === contentSig) {
+    return { ok: true, updatedAt: draft.updatedAt || updatedAt };
+  }
+
   try {
     const docRef = doc(db, DRAFT_COLLECTION, docId);
     if (!draft) {
-      await setDoc(
-        docRef,
-        sanitizeForFirestore({
-          clearedAt: updatedAt,
-          ownerEmail: normalizedEmail,
-          senderClientId: clientId || null,
-          factoryInfo: null,
-          sections: null,
-          updatedAt,
-        })
+      await withTimeout(
+        setDoc(
+          docRef,
+          sanitizeForFirestore({
+            clearedAt: updatedAt,
+            ownerEmail: normalizedEmail,
+            senderClientId: clientId || null,
+            factoryInfo: null,
+            sections: null,
+            updatedAt,
+          })
+        ),
+        3500,
+        'Draft clear write timeout'
       );
+      lastSyncedSigMap.delete(docId);
       return { ok: true, updatedAt };
     }
 
@@ -488,13 +729,41 @@ export async function syncDraftToFirestore(
       clearedAt: null,
     };
 
-    const offloadedDraft = await offloadPayloadPhotos(docId, baseDraft, normalizedEmail);
+    const offloadedDraft = await withTimeout(
+      offloadPayloadPhotos(docId, baseDraft, normalizedEmail),
+      4500,
+      'Photo offload timeout'
+    );
+    if (isFirestoreWritePaused()) {
+      return {
+        ok: false,
+        error: 'Firestore daily write quota paused; saved locally',
+        quotaPaused: true,
+      };
+    }
     const cleanDraft = sanitizeForFirestore(offloadedDraft);
-    await setDoc(docRef, cleanDraft, { merge: false });
+    const serializedLen = JSON.stringify(cleanDraft).length;
+    if (serializedLen > 950000) {
+      return { ok: false, error: 'Draft stored locally (cloud quota/size guard)' };
+    }
+    await withTimeout(setDoc(docRef, cleanDraft, { merge: false }), 3500, 'Draft write timeout');
+    saveLastSyncedSig(docId, contentSig);
     return { ok: true, updatedAt: cleanDraft.updatedAt || updatedAt };
   } catch (err) {
+    const quotaHit = isQuotaError(err);
+    const timeoutOnline =
+      isWriteTimeoutError(err) && (typeof navigator === 'undefined' || navigator.onLine !== false);
+    if (quotaHit) {
+      pauseFirestoreWrites(4 * 60 * 60 * 1000, true);
+    } else if (timeoutOnline) {
+      pauseFirestoreWrites(4 * 60 * 60 * 1000, true);
+    }
     logFirestoreError(err, OperationType.WRITE, path);
-    return { ok: false, error: err instanceof Error ? err.message : String(err) };
+    return {
+      ok: false,
+      error: err instanceof Error ? err.message : String(err),
+      quotaPaused: quotaHit || timeoutOnline,
+    };
   }
 }
 
@@ -656,24 +925,34 @@ export async function clearFirestoreDraft(
   userEmail?: string | null,
   clientId?: string
 ): Promise<void> {
-  if (!db || !userEmail || !userEmail.trim()) return;
+  if (!db || !userEmail || !userEmail.trim() || isFirestoreWritePaused()) return;
   const normalizedEmail = userEmail.trim().toLowerCase();
   const docId = getDraftDocId(normalizedEmail);
   const path = `${DRAFT_COLLECTION}/${docId}`;
   try {
     const docRef = doc(db, DRAFT_COLLECTION, docId);
-    await setDoc(
-      docRef,
-      sanitizeForFirestore({
-        clearedAt: new Date().toISOString(),
-        ownerEmail: normalizedEmail,
-        senderClientId: clientId || null,
-        factoryInfo: null,
-        sections: null,
-        updatedAt: new Date().toISOString(),
-      })
+    await withTimeout(
+      setDoc(
+        docRef,
+        sanitizeForFirestore({
+          clearedAt: new Date().toISOString(),
+          ownerEmail: normalizedEmail,
+          senderClientId: clientId || null,
+          factoryInfo: null,
+          sections: null,
+          updatedAt: new Date().toISOString(),
+        })
+      ),
+      3500,
+      'Clear draft write timeout'
     );
+    lastSyncedSigMap.delete(docId);
   } catch (err) {
+    if (isQuotaError(err)) {
+      pauseFirestoreWrites(4 * 60 * 60 * 1000, true);
+    } else if (isWriteTimeoutError(err) && (typeof navigator === 'undefined' || navigator.onLine !== false)) {
+      pauseFirestoreWrites(4 * 60 * 60 * 1000, true);
+    }
     logFirestoreError(err, OperationType.WRITE, path);
   }
 }
@@ -682,7 +961,8 @@ export async function clearFirestoreDraft(
  * Saves a completed audit report to Firestore (offloading photos if > 200KB so large reports always save)
  */
 export async function saveAuditToFirestore(report: AuditReportData): Promise<void> {
-  if (!db) return;
+  await ensureQuotaStatusHydrated();
+  if (!db || isFirestoreWritePaused()) return;
   const path = `${AUDITS_COLLECTION}/${report.id}`;
   try {
     const docRef = doc(db, AUDITS_COLLECTION, report.id);
@@ -691,8 +971,14 @@ export async function saveAuditToFirestore(report: AuditReportData): Promise<voi
       approxSize > 200000
         ? await offloadPayloadPhotos(`rep_${report.id}`, report, report.auditorEmail)
         : report;
-    await setDoc(docRef, sanitizeForFirestore(payloadToSave));
+    if (isFirestoreWritePaused() || !db) return;
+    await withTimeout(setDoc(docRef, sanitizeForFirestore(payloadToSave)), 4500, 'Save audit write timeout');
   } catch (err) {
+    if (isQuotaError(err)) {
+      pauseFirestoreWrites(4 * 60 * 60 * 1000, true);
+    } else if (isWriteTimeoutError(err) && (typeof navigator === 'undefined' || navigator.onLine !== false)) {
+      pauseFirestoreWrites(4 * 60 * 60 * 1000, true);
+    }
     logFirestoreError(err, OperationType.WRITE, path);
   }
 }

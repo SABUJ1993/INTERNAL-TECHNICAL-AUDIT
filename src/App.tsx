@@ -42,6 +42,7 @@ import {
   hydratePayloadPhotos,
   saveDraftToIndexedDB,
   clearDraftFromIndexedDB,
+  isFirestoreWritePaused,
   isAuditorAdmin,
 } from './services/api';
 import { subscribeToFirestoreDraft, clearFirestoreDraft } from './services/firebase';
@@ -120,13 +121,14 @@ export default function App() {
   const [viewMode, setViewMode] = useState<ViewMode>('auto');
   const [isShareModalOpen, setIsShareModalOpen] = useState(false);
 
+  const flushBeforeUpdateRef = useRef<() => Promise<void>>(async () => {});
   const {
     updateAvailable,
     newVersion,
     isUpdating,
     applyUpdate,
     dismissUpdate,
-  } = useAppUpdate();
+  } = useAppUpdate(() => flushBeforeUpdateRef.current());
 
   const [factoryInfo, setFactoryInfo] = useState<FactoryInfo>(() => {
     const user = getCurrentUser();
@@ -218,6 +220,7 @@ export default function App() {
   const isRemoteUpdateRef = useRef(false);
   const isInitializedRef = useRef(false);
   const hasLocalEditsSinceMountRef = useRef(false);
+  const hasUnsyncedCloudChangesRef = useRef(false);
   const syncTimeoutRef = useRef<any>(null);
   const editingReportIdRef = useRef<string | null>(null);
   editingReportIdRef.current = editingReportId;
@@ -253,15 +256,32 @@ export default function App() {
     }
   }, [currentUser, factoryInfo.auditorName]);
 
+  flushBeforeUpdateRef.current = async () => {
+    const email = latestDraftRef.current.ownerEmail || currentUser?.email?.trim().toLowerCase() || '';
+    if (!email || editingReportIdRef.current) return;
+    if (!isInitializedRef.current && !hasLocalEditsSinceMountRef.current) return;
+    await saveActiveDraftImmediate(latestDraftRef.current, email);
+  };
+
   const handleLocalFactoryChange = (updated: FactoryInfo) => {
     lastLocalEditTsRef.current = Date.now();
     hasLocalEditsSinceMountRef.current = true;
+    hasUnsyncedCloudChangesRef.current = true;
+    latestDraftRef.current = {
+      ...latestDraftRef.current,
+      factoryInfo: updated,
+    };
     setFactoryInfo(updated);
   };
 
   const handleLocalSectionsChange = (updated: AuditSection[]) => {
     lastLocalEditTsRef.current = Date.now();
     hasLocalEditsSinceMountRef.current = true;
+    hasUnsyncedCloudChangesRef.current = true;
+    latestDraftRef.current = {
+      ...latestDraftRef.current,
+      sections: updated,
+    };
     setSections(updated);
   };
 
@@ -384,83 +404,104 @@ export default function App() {
     }, 60);
   };
 
-  // Initial local IndexedDB + Firestore + Server draft reconciliation (newest timestamp wins, strictly scoped to currentUser.email)
+  // Two-phase startup reconciliation:
+  // Phase 1: Immediately restore full IndexedDB draft + photos (~15ms) so slow network never blocks or causes 0-photo overwrites
+  // Phase 2: Reconcile newer remote updates from Firestore / Server without ever wiping unsynced local photos
   useEffect(() => {
     if (!currentUser?.email) return;
     const normalizedEmail = currentUser.email.trim().toLowerCase();
+    const thisClientId = getClientDeviceId();
     let cancelled = false;
     isInitializedRef.current = false;
 
+    const isDemoFactory = (d: any) =>
+      d?.factoryInfo?.name === 'Northern Fashions Ltd.' ||
+      d?.factoryInfo?.name === 'Apex Textile Mills Ltd.';
+
+    const localDbPromise = loadActiveDraftAsync(normalizedEmail).catch(() => null);
+
+    // Phase 1: Instant IndexedDB hydration
+    localDbPromise.then((localDbDraft) => {
+      if (cancelled) return;
+      if (
+        localDbDraft &&
+        (localDbDraft.factoryInfo || localDbDraft.sections) &&
+        !isDemoFactory(localDbDraft) &&
+        (!localDbDraft.ownerEmail || localDbDraft.ownerEmail.trim().toLowerCase() === normalizedEmail) &&
+        !editingReportIdRef.current &&
+        !hasLocalEditsSinceMountRef.current
+      ) {
+        applyAuthoritativeDraft(localDbDraft, {
+          isAuthoritative: true,
+          persistToIdb: false,
+        });
+      }
+      isInitializedRef.current = true;
+    });
+
+    // Phase 2: Cloud reconciliation
     Promise.all([
-      loadActiveDraftAsync(normalizedEmail).catch(() => null),
+      localDbPromise,
       fetchDraftFromFirestore(normalizedEmail).catch(() => null),
       fetchServerActiveDraft(normalizedEmail).catch(() => null),
-    ])
-      .then(([localDbDraft, firestoreDraft, serverDraft]) => {
-        if (cancelled) return;
-        const candidates: Array<{ source: string; draft: any; ts: number; authoritative: boolean }> = [];
+    ]).then(([localDbDraft, firestoreDraft, serverDraft]) => {
+      if (cancelled || editingReportIdRef.current) return;
 
-        const isDemoFactory = (d: any) =>
-          d?.factoryInfo?.name === 'Northern Fashions Ltd.' ||
-          d?.factoryInfo?.name === 'Apex Textile Mills Ltd.';
+      const localDbValid =
+        localDbDraft &&
+        (localDbDraft.factoryInfo || localDbDraft.sections) &&
+        !isDemoFactory(localDbDraft) &&
+        (!localDbDraft.ownerEmail || localDbDraft.ownerEmail.trim().toLowerCase() === normalizedEmail);
+      const localDbTs = localDbValid ? new Date(localDbDraft.updatedAt || 0).getTime() : 0;
 
-        if (localDbDraft && (localDbDraft.factoryInfo || localDbDraft.sections) && !isDemoFactory(localDbDraft)) {
-          const ownerMatch =
-            !localDbDraft.ownerEmail || localDbDraft.ownerEmail.trim().toLowerCase() === normalizedEmail;
-          if (ownerMatch) {
-            candidates.push({
-              source: 'indexeddb',
-              draft: localDbDraft,
-              ts: new Date(localDbDraft.updatedAt || 0).getTime(),
-              authoritative: false,
-            });
-          }
+      const cloudCandidates: Array<{ source: string; draft: any; ts: number }> = [];
+      if (firestoreDraft && (firestoreDraft.factoryInfo || firestoreDraft.sections) && !isDemoFactory(firestoreDraft)) {
+        if (!firestoreDraft.ownerEmail || firestoreDraft.ownerEmail.trim().toLowerCase() === normalizedEmail) {
+          cloudCandidates.push({
+            source: 'firestore',
+            draft: firestoreDraft,
+            ts: new Date(firestoreDraft.updatedAt || 0).getTime(),
+          });
         }
+      }
+      if (serverDraft && (serverDraft.factoryInfo || serverDraft.sections) && !isDemoFactory(serverDraft)) {
+        if (!serverDraft.ownerEmail || serverDraft.ownerEmail.trim().toLowerCase() === normalizedEmail) {
+          cloudCandidates.push({
+            source: 'server',
+            draft: serverDraft,
+            ts: new Date(serverDraft.updatedAt || 0).getTime(),
+          });
+        }
+      }
 
-        if (firestoreDraft && (firestoreDraft.factoryInfo || firestoreDraft.sections) && !isDemoFactory(firestoreDraft)) {
-          const ownerMatch =
-            !firestoreDraft.ownerEmail || firestoreDraft.ownerEmail.trim().toLowerCase() === normalizedEmail;
-          if (ownerMatch) {
-            candidates.push({
-              source: 'firestore',
-              draft: firestoreDraft,
-              ts: new Date(firestoreDraft.updatedAt || 0).getTime(),
-              authoritative: true,
-            });
-          }
-        }
+      if (cloudCandidates.length > 0) {
+        cloudCandidates.sort((a, b) => a.ts - b.ts);
+        const newestCloud = cloudCandidates[cloudCandidates.length - 1];
+        const fromAnotherDevice =
+          !newestCloud.draft.senderClientId || newestCloud.draft.senderClientId !== thisClientId;
 
-        if (serverDraft && (serverDraft.factoryInfo || serverDraft.sections) && !isDemoFactory(serverDraft)) {
-          const ownerMatch =
-            !serverDraft.ownerEmail || serverDraft.ownerEmail.trim().toLowerCase() === normalizedEmail;
-          if (ownerMatch) {
-            candidates.push({
-              source: 'server',
-              draft: serverDraft,
-              ts: new Date(serverDraft.updatedAt || 0).getTime(),
-              authoritative: true,
-            });
-          }
+        // Apply remote draft ONLY if it came from another device AND is strictly newer than both IndexedDB and any local edits
+        if (
+          fromAnotherDevice &&
+          newestCloud.ts > localDbTs &&
+          (!hasLocalEditsSinceMountRef.current || newestCloud.ts > lastLocalEditTsRef.current)
+        ) {
+          applyAuthoritativeDraft(newestCloud.draft, {
+            isAuthoritative: true,
+            persistToIdb: true,
+          });
+          return;
         }
+      }
 
-        if (candidates.length > 0 && !editingReportIdRef.current) {
-          // Sort oldest to newest so newest wins cleanly while preserving local photos if needed
-          candidates.sort((a, b) => a.ts - b.ts);
-          const newest = candidates[candidates.length - 1];
-          // Never overwrite typing the user already started since mount!
-          if (!hasLocalEditsSinceMountRef.current || newest.ts > lastLocalEditTsRef.current) {
-            applyAuthoritativeDraft(newest.draft, {
-              isAuthoritative: newest.authoritative,
-              persistToIdb: newest.source !== 'indexeddb',
-            });
-          }
+      // If IndexedDB had meaningfully newer unsynced local work, push it to Express SSE cleanly without burning Firestore startup writes
+      if (localDbValid && !hasLocalEditsSinceMountRef.current) {
+        const newestCloudTs = cloudCandidates.length > 0 ? cloudCandidates[cloudCandidates.length - 1].ts : 0;
+        if (localDbTs > newestCloudTs + 2000) {
+          saveActiveDraft(localDbDraft, false, normalizedEmail, true);
         }
-      })
-      .finally(() => {
-        if (!cancelled) {
-          isInitializedRef.current = true;
-        }
-      });
+      }
+    });
 
     return () => {
       cancelled = true;
@@ -582,13 +623,15 @@ export default function App() {
     };
   }, [currentUser]);
 
-  // Auto-save live draft on changes ONLY when working in own live audit workspace (not when editing a saved report)
+  // Auto-save live draft on CONTENT changes ONLY when working in own live audit workspace (not when editing a saved report)
   useEffect(() => {
     if (!currentUser?.email || isRemoteUpdateRef.current || editingReportId) {
       return;
     }
-    // Wait for initial fetch ONLY if user hasn't typed anything locally yet
     if (!isInitializedRef.current && !hasLocalEditsSinceMountRef.current) {
+      return;
+    }
+    if (!hasLocalEditsSinceMountRef.current) {
       return;
     }
 
@@ -601,16 +644,38 @@ export default function App() {
           ownerEmail: email,
           factoryInfo,
           sections,
-          currentTab,
-          activeSectionId,
+          currentTab: latestDraftRef.current.currentTab,
+          activeSectionId: latestDraftRef.current.activeSectionId,
         },
         false,
-        email
+        email,
+        false
       );
       setIsSaved(true);
     }, 200);
     return () => clearTimeout(timer);
-  }, [factoryInfo, sections, currentTab, activeSectionId, currentUser, editingReportId]);
+  }, [factoryInfo, sections, currentUser, editingReportId]);
+
+  // Persist active tab & section locally (and via SSE) WITHOUT triggering Firestore quota writes
+  useEffect(() => {
+    if (!currentUser?.email || isRemoteUpdateRef.current || editingReportId) {
+      return;
+    }
+    if (!isInitializedRef.current) return;
+    const email = currentUser.email.trim().toLowerCase();
+    saveActiveDraft(
+      {
+        ownerEmail: email,
+        factoryInfo: latestDraftRef.current.factoryInfo,
+        sections: latestDraftRef.current.sections,
+        currentTab,
+        activeSectionId,
+      },
+      false,
+      email,
+      true
+    );
+  }, [currentTab, activeSectionId, currentUser, editingReportId]);
 
   // Instant flush on mobile minimize + foreground wake-up cloud re-sync on visibility/focus/online
   useEffect(() => {
@@ -619,9 +684,10 @@ export default function App() {
 
     const flushNow = () => {
       if (editingReportIdRef.current) return;
-      if (!isInitializedRef.current && !hasLocalEditsSinceMountRef.current) return;
+      if (!hasUnsyncedCloudChangesRef.current) return;
       const targetEmail = latestDraftRef.current.ownerEmail || email;
       if (!targetEmail) return;
+      hasUnsyncedCloudChangesRef.current = false;
       saveActiveDraftImmediate(latestDraftRef.current, targetEmail).catch(() => {});
     };
 
@@ -689,6 +755,10 @@ export default function App() {
     setSyncingCheckpointId(checkpointId);
     lastLocalEditTsRef.current = Date.now();
     hasLocalEditsSinceMountRef.current = true;
+    latestDraftRef.current = {
+      ...latestDraftRef.current,
+      sections: updatedSections,
+    };
     setSyncMessage('Saving Draft & Syncing Live...');
     if (syncTimeoutRef.current) clearTimeout(syncTimeoutRef.current);
 
@@ -705,8 +775,15 @@ export default function App() {
           },
           ownerEmail
         );
+        hasUnsyncedCloudChangesRef.current = false;
         setIsSaved(true);
-        setSyncMessage(res.ok ? 'Draft Saved & Live Synced' : 'Saved Locally (Retrying Cloud)');
+        setSyncMessage(
+          res.ok
+            ? 'Draft Saved & Live Synced'
+            : res.quotaPaused
+              ? 'Saved Locally (Cloud Quota Paused)'
+              : 'Saved Locally (Cloud Sync Queued)'
+        );
       } else if (!editingReportIdRef.current.startsWith('LIVE-')) {
         const recalculated = calculateAuditReport(
           latestDraftRef.current.factoryInfo,
@@ -966,7 +1043,8 @@ export default function App() {
 
   const handleLogout = () => {
     const email = currentUser?.email?.trim().toLowerCase();
-    if (!editingReportId && email) {
+    if (!editingReportId && email && hasUnsyncedCloudChangesRef.current) {
+      hasUnsyncedCloudChangesRef.current = false;
       saveActiveDraftImmediate(latestDraftRef.current, email).catch(() => {});
     }
     logoutAuditor(email);
@@ -1026,8 +1104,15 @@ export default function App() {
           },
           ownerEmail
         );
+        hasUnsyncedCloudChangesRef.current = false;
         setIsSaved(true);
-        setSyncMessage(res.ok ? 'Draft Saved & Live Synced' : 'Draft Saved Locally');
+        setSyncMessage(
+          res.ok
+            ? 'Draft Saved & Live Synced'
+            : res.quotaPaused
+              ? 'Saved Locally (Cloud Quota Paused)'
+              : 'Draft Saved Locally'
+        );
       } else if (!editingReportIdRef.current.startsWith('LIVE-')) {
         await handleSaveReportDirect(activeReportData);
       }

@@ -60,16 +60,10 @@ export const LoginScreen: React.FC<Props> = ({ onLoginSuccess }) => {
   const [error, setError] = useState('');
   const [successMessage, setSuccessMessage] = useState('');
 
-  // Auto-populate saved credentials if remember me was active
+  // Always start with clean blank credentials so shared links never expose another user's email/password
   useEffect(() => {
     try {
-      const saved = localStorage.getItem('saved_auditor_credentials');
-      if (saved) {
-        const parsed = JSON.parse(saved);
-        if (parsed.email) setLoginEmail(parsed.email);
-        if (parsed.password) setLoginPassword(parsed.password);
-        setRememberMe(true);
-      }
+      localStorage.removeItem('saved_auditor_credentials');
     } catch {
       // ignore
     }
@@ -98,19 +92,6 @@ export const LoginScreen: React.FC<Props> = ({ onLoginSuccess }) => {
     try {
       setLoading(true);
       const user = await loginAuditor(loginEmail.trim(), loginPassword.trim());
-
-      // Save credentials if Remember Me is checked
-      if (rememberMe) {
-        localStorage.setItem(
-          'saved_auditor_credentials',
-          JSON.stringify({
-            email: loginEmail.trim(),
-            password: loginPassword.trim(),
-          })
-        );
-      } else {
-        localStorage.removeItem('saved_auditor_credentials');
-      }
 
       setSuccessMessage('Login successful! Opening Audit Suite...');
       setTimeout(() => {
@@ -180,15 +161,6 @@ export const LoginScreen: React.FC<Props> = ({ onLoginSuccess }) => {
         verificationCode: verificationCode.trim(),
       });
 
-      // Save credentials for instant future login
-      localStorage.setItem(
-        'saved_auditor_credentials',
-        JSON.stringify({
-          email: regEmail.trim(),
-          password: regPassword.trim(),
-        })
-      );
-
       setSuccessMessage('Account verified & registered successfully! Launching audit suite...');
       setTimeout(() => {
         onLoginSuccess(user);
@@ -257,17 +229,6 @@ export const LoginScreen: React.FC<Props> = ({ onLoginSuccess }) => {
       await resetAuditorPassword(forgotEmail.trim(), forgotOtp.trim(), forgotNewPass.trim());
 
       setSuccessMessage('Password reset successfully! Logging you in...');
-
-      // Save new credentials if Remember Me was chosen
-      if (rememberMe) {
-        localStorage.setItem(
-          'saved_auditor_credentials',
-          JSON.stringify({
-            email: forgotEmail.trim(),
-            password: forgotNewPass.trim(),
-          })
-        );
-      }
 
       // Auto login with new password
       const user = await loginAuditor(forgotEmail.trim(), forgotNewPass.trim());
@@ -409,7 +370,7 @@ export const LoginScreen: React.FC<Props> = ({ onLoginSuccess }) => {
 
           {/* 1. LOGIN FORM */}
           {mode === 'login' ? (
-            <form onSubmit={handleLoginSubmit} className="space-y-3.5">
+            <form onSubmit={handleLoginSubmit} autoComplete="off" className="space-y-3.5">
               <div>
                 <label className="block text-xs font-bold text-slate-800 mb-1">
                   User Email <span className="text-red-500">*</span>
@@ -418,6 +379,8 @@ export const LoginScreen: React.FC<Props> = ({ onLoginSuccess }) => {
                   <Mail className="w-4 h-4 text-slate-400 absolute left-3 top-3 pointer-events-none" />
                   <input
                     type="email"
+                    name="auditor_email_input"
+                    autoComplete="off"
                     value={loginEmail}
                     onChange={(e) => setLoginEmail(e.target.value)}
                     placeholder="user@mail.com"
@@ -436,6 +399,8 @@ export const LoginScreen: React.FC<Props> = ({ onLoginSuccess }) => {
                   <Lock className="w-4 h-4 text-slate-400 absolute left-3 top-3 pointer-events-none" />
                   <input
                     type={showPassword ? 'text' : 'password'}
+                    name="auditor_password_input"
+                    autoComplete="new-password"
                     value={loginPassword}
                     onChange={(e) => setLoginPassword(e.target.value)}
                     placeholder="Enter account password"
